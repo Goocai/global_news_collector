@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>统计面板 - 全球新闻阅读影响趋势预测</title>
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="/js/auth.js"></script>
+</head>
+<body class="bg-gray-100">
+    <div x-data="statsApp()" x-init="init()" class="container mx-auto p-4">
+        
+        <!-- 导航栏 -->
+        <nav class="bg-white shadow mb-6 p-4 rounded-lg flex justify-between items-center">
+            <h1 class="text-3xl font-bold mb-6 text-center">📊 统计面板 & 认知纠偏</h1>
+            <div class="space-x-4">
+                <a href="/admin.html" class="text-blue-600 hover:underline">🔧 管理</a>
+                <button @click="logout" class="bg-red-500 hover:bg-red-600 text-white px-3 py-1 rounded text-sm">退出</button>
+            </div>
+        </nav>
+
+        <!-- 新闻列表 -->
+        <!-- 不对称比卡片 -->
+        <div class="bg-white rounded-lg shadow p-4 mb-6">
+            <h2 class="text-xl font-semibold">不对称比 (Asymmetry Ratio)</h2>
+            <div class="text-4xl font-bold mt-2" x-text="asymmetryRatio"></div>
+            <p class="text-sm text-gray-500">目标 > 1.5，越高代表仓位管理越反脆弱</p>
+            <div x-show="asymmetryRatio < 1.5" class="mt-2 bg-yellow-100 text-yellow-800 p-2 rounded">
+                ⚠️ 仓位管理过于平均，处于脆弱状态
+            </div>
+        </div>
+
+        <!-- Brier 曲线 -->
+        <div class="bg-white rounded-lg shadow p-4 mb-6">
+            <h2 class="text-xl font-semibold mb-2">Brier Score 对抗曲线</h2>
+            <canvas id="brierChart" width="400" height="200"></canvas>
+        </div>
+
+        <!-- 反脆弱气泡图 (使用 Chart.js 散点图) -->
+        <div class="bg-white rounded-lg shadow p-4 mb-6">
+            <h2 class="text-xl font-semibold mb-2">反脆弱气泡图 (概率 vs 结果，气泡大小=仓位)</h2>
+            <canvas id="bubbleChart" width="400" height="200"></canvas>
+        </div>
+
+        <!-- 强制复盘黑名单 -->
+        <div class="bg-white rounded-lg shadow p-4 mb-6">
+            <h2 class="text-xl font-semibold mb-2 text-red-700">⚠️ 待复盘黑名单</h2>
+            <div x-show="pendingReviews.length === 0" class="text-gray-500">暂无待复盘项</div>
+            <div x-for="review in pendingReviews" :key="review.id" class="border-t py-4">
+                <div class="font-bold" x-text="review.news_title"></div>
+                <div class="text-sm text-gray-600">预测概率: <span x-text="review.probability"></span>%, 结果: <span x-text="review.outcome === 1 ? '证实' : '证伪'"></span></div>
+                <div class="text-sm text-gray-600">推演: <span x-text="review.inference"></span></div>
+                <textarea x-model="review.postMortem" placeholder="请写下反思复盘..." class="w-full border rounded p-2 mt-2"></textarea>
+                <button @click="submitReview(review.id, review.postMortem)" class="bg-blue-600 text-white px-4 py-2 rounded mt-2">提交复盘</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function statsApp() {
+            return {
+                asymmetryRatio: 0,
+                brierHistory: [],
+                bubbleData: [],
+                pendingReviews: [],
+                brierChart: null,
+                bubbleChart: null,
+                async init() {
+                    Auth.requireAuth();
+                    await this.loadAntiFragile();
+                    await this.loadBrierHistory();
+                    await this.loadPendingReviews();
+                    this.renderCharts();
+                },
+                async loadAntiFragile() {
+                    const headers = { ...Auth.getHeaders() };
+                    const res = await fetch('/api/stats/anti-fragile',{headers});
+                    if (res.ok) {
+                        const data = await res.json();
+                        this.asymmetryRatio = parseFloat(data.asymmetry_ratio).toFixed(2);
+                        this.bubbleData = data.bubble_data.map(p => ({
+                            x: parseFloat(p.probability),
+                            y: p.outcome,
+                            r: parseFloat(p.position_size_pct) / 2  // 半径缩放
+                        }));
+                    }
+                },
+                async loadBrierHistory() {
+                    const headers = { ...Auth.getHeaders() };
+                    const res = await fetch('/api/stats/brier',{headers});
+                    if (res.ok) {
+                        this.brierHistory = await res.json();
+                    }
+                },
+                async loadPendingReviews() {
+                    const headers = { ...Auth.getHeaders() };
+                    const res = await fetch('/api/reviews/pending-reviews',{headers});
+                    if (res.ok) {
+                        this.pendingReviews = await res.json();
+                        this.pendingReviews.forEach(r => r.postMortem = '');
+                    }
+                },
+                async submitReview(id, text) {
+                    const headers = { 'Content-Type': 'application/json', ...Auth.getHeaders() };
+                    const res = await fetch(`/api/reviews/${id}/post_mortem`, {
+                        method: 'POST',
+                        headers,
+                        body: JSON.stringify({ post_mortem: text })
+                    });
+                    if (res.ok) {
+                        // 从列表中移除
+                        this.pendingReviews = this.pendingReviews.filter(r => r.id !== id);
+                    } else {
+                        alert('提交失败');
+                    }
+                },
+                renderCharts() {
+                    if (this.brierHistory.length > 0) {
+                        const labels = this.brierHistory.map(h => new Date(h.calculation_time).toLocaleDateString());
+                        const humanData = this.brierHistory.map(h => parseFloat(h.human_brier));
+                        const llmData = this.brierHistory.map(h => parseFloat(h.llm_brier));
+                        const ctx = document.getElementById('brierChart').getContext('2d');
+                        this.brierChart = new Chart(ctx, {
+                            type: 'line',
+                            data: { labels, datasets: [
+                                { label: '人类 Brier', data: humanData, borderColor: 'blue' },
+                                { label: 'LLM Brier', data: llmData, borderColor: 'red' }
+                            ]}
+                        });
+                    }
+                    if (this.bubbleData.length > 0) {
+                        const ctxBubble = document.getElementById('bubbleChart').getContext('2d');
+                        this.bubbleChart = new Chart(ctxBubble, {
+                            type: 'bubble',
+                            data: { datasets: [{ label: '预测', data: this.bubbleData, backgroundColor: 'rgba(0, 123, 255, 0.6)' }] },
+                            options: { scales: { x: { title: { display: true, text: '概率 (%)' }, min: 0, max: 100 },
+                                                y: { title: { display: true, text: '结果 (0=证伪,1=证实)' }, ticks: { stepSize: 1 } } } }
+                        });
+                    }
+                },
+                logout() {
+                    Auth.logout();
+                }
+            }
+        }
+    </script>
+</body>
+</html>

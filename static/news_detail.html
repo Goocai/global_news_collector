@@ -1,0 +1,242 @@
+
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>新闻详情 - 全球新闻阅读影响趋势预测</title>
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="/js/auth.js"></script>
+</head>
+<body class="bg-gray-100">
+    <div x-data="newsDetail()" x-init="init()" class="container mx-auto p-4 max-w-3xl">
+        <a href="/" class="text-blue-600 hover:underline mb-4 inline-block">← 返回列表</a>
+        <div class="bg-white p-6 rounded-lg shadow">
+            <h1 class="text-2xl font-bold mb-2" x-text="news.title"></h1>
+            <div class="text-sm text-gray-500 mb-4">
+                <span x-text="news.source_name"></span> · 
+                <span x-text="news.published_at ? new Date(news.published_at).toLocaleString() : ''"></span>
+            </div>
+
+            <!-- 摘要区域（summary） -->
+            <div class="mb-4 text-gray-700 border-l-4 border-blue-300 pl-4 italic" x-show="news.summary">
+                <p class="text-sm font-semibold text-gray-500">📌 摘要</p>
+                <p x-text="news.summary"></p>
+            </div>
+
+            <!-- 正文区域（content） -->
+            <div class="prose max-w-none" x-show="news.content && !loadingContent">
+                <p class="text-sm font-semibold text-gray-500 mb-1">📄 正文</p>
+                <div x-html="news.content"></div>
+            </div>
+
+            <!-- 正文加载中提示 -->
+            <div class="text-blue-500 italic" x-show="news.fetching || loadingContent">
+                🔄 正在加载正文，请稍后...
+            </div>
+
+
+            <!-- 当两者都为空时的备用提示 -->
+            <div class="text-gray-500 italic" x-show="!news.summary && !news.content && !loadingContent">
+                暂无摘要或正文，请点击原文链接查看。
+            </div>
+
+            <div class="mt-6 pt-4 border-t">
+                <a :href="news.url" target="_blank" class="text-blue-600 hover:underline">阅读原文 ↗</a>
+            </div>
+        </div>
+
+        <!-- ========= 推演表单区域 (默认折叠，点击展开) ========= -->
+        <div class="mt-8 bg-white rounded-lg shadow" x-data="{ showForm: false }">
+            <button @click="showForm = !showForm" 
+                    class="w-full text-left px-6 py-3 bg-gray-50 hover:bg-gray-100 rounded-t-lg font-semibold flex justify-between items-center">
+                <span>📊 添加推演预测</span>
+                <span x-text="showForm ? '▲' : '▼'"></span>
+            </button>
+            <div x-show="showForm" x-cloak class="p-6 border-t">
+                <form @submit.prevent="submitPrediction">
+                    <!-- 摘取事实 (可选) -->
+                    <div class="mb-4">
+                        <label class="block text-gray-700 font-medium mb-2">摘取事实</label>
+                        <textarea x-model="form.extractedFacts" rows="2"
+                                  class="w-full border rounded px-3 py-2" placeholder="例如：央行今日宣布降息25个基点..."></textarea>
+                    </div>
+
+                    <!-- 推演描述 (必填) -->
+                    <div class="mb-4">
+                        <label class="block text-gray-700 font-medium mb-2">逻辑推演 <span class="text-red-500">*</span></label>
+                        <textarea x-model="form.inference" rows="3" required
+                                  class="w-full border rounded px-3 py-2" placeholder="基于以上事实，我认为..."></textarea>
+                    </div>
+
+                    <!-- 主观胜率滑块 -->
+                    <div class="mb-4">
+                        <label class="block text-gray-700 font-medium mb-2">主观胜率: <span x-text="form.probability"></span>%</label>
+                        <input type="range" x-model="form.probability" min="0" max="100" class="w-full">
+                    </div>
+
+                    <!-- 虚拟仓位滑块 (必填，强校验) -->
+                    <div class="mb-4">
+                        <label class="block text-gray-700 font-medium mb-2">
+                            虚拟仓位 <span class="text-red-500">*</span>
+                            <span x-show="form.positionSize === null" class="text-red-500 text-sm ml-2">必须填写</span>
+                        </label>
+                        <input type="range" x-model="form.positionSize" min="0" max="100" class="w-full" required>
+                        <div class="text-center text-sm text-gray-500 mt-1" x-text="form.positionSize !== null ? form.positionSize + '%' : '未选择'"></div>
+                    </div>
+
+                    <!-- 预期兑现日 (必填，最小 UTC+1) -->
+                    <div class="mb-4">
+                        <label class="block text-gray-700 font-medium mb-2">预期兑现日 <span class="text-red-500">*</span></label>
+                        <input type="date" x-model="form.targetDate" :min="minDate" required
+                               class="w-full border rounded px-3 py-2">
+                    </div>
+
+                    <!-- 判定规则模板简化版 -->
+                    <div class="mb-6">
+                        <label class="block text-gray-700 font-medium mb-2">判定规则</label>
+                        <select x-model="form.ruleType" class="w-full border rounded px-3 py-2">
+                            <option value="price_change">价格涨跌幅</option>
+                            <option value="central_bank">央行利率决议</option>
+                            <option value="url_keyword">URL关键词检测</option>
+                            <option value="economic_data">经济数据对比</option>
+                        </select>
+                    </div>
+
+                    <button type="submit" class="bg-green-600 hover:bg-green-700 text-white px-6 py-2 rounded-lg font-semibold">
+                        提交预测
+                    </button>
+                </form>
+            </div>
+        </div>
+        <style>
+            [x-cloak] { display: none !important; }
+        </style>
+    </div>
+    <script>
+        function newsDetail() {
+            const urlParams = new URLSearchParams(window.location.search);
+            const id = urlParams.get('id');
+
+            // 计算 UTC 日期+1 作为最小可选的 target_date
+            const tomorrow = new Date();
+            tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
+            const minDate = tomorrow.toISOString().split('T')[0];
+
+            return {
+                news: {},
+                form: {
+                    extractedFacts: '',
+                    inference: '',
+                    probability: 50,
+                    positionSize: null,
+                    targetDate: '',
+                    ruleType: 'price_change'
+                },
+                minDate: minDate,
+                loadingContent: false,
+                pollCount: 0,
+                maxPollCount: 12,           // 最多12次
+                pollInterval: null,
+
+                async init() {
+                    Auth.requireAuth();
+                    await this.loadNews();
+                },
+
+                async loadNews() {
+                    const headers = { ...Auth.getHeaders() };
+                    const res = await fetch(`/api/news/${id}`, { headers });
+                    if (res.ok) {
+                        const data = await res.json();
+                        this.news = data;
+                        // 如果 content 为空且（正在抓取 或 尚未开始轮询）且未超限，启动轮询
+                        if (!this.news.content && (this.news.fetching || !this.loadingContent) && this.pollCount < this.maxPollCount) {
+                            this.startPolling();
+                        }
+                    } else {
+                        this.news = { title: '加载失败', content: '无法获取新闻详情' };
+                    }
+                },
+
+                startPolling() {
+                    this.loadingContent = true;
+                    this.pollInterval = setInterval(async () => {
+                        this.pollCount++;
+                        const headers = { ...Auth.getHeaders() };
+                        const res = await fetch(`/api/news/${id}`, { headers });
+                        if (res.ok) {
+                            const data = await res.json();
+                            this.news = data;
+                            if (this.news.content) {
+                                // 获取到正文，停止轮询
+                                this.stopPolling();
+                            } else if (!this.news.fetching) {
+                                // 后端不再抓取但内容仍为空 → 抓取失败
+                                this.stopPolling();
+                                alert('正文加载失败，请稍后刷新');
+                            } else if (this.pollCount >= this.maxPollCount) {
+                                // 超过最大次数
+                                this.stopPolling();
+                                alert('正文加载超时，请稍后刷新');
+                            }
+                        } else {
+                            this.stopPolling();
+                            alert('正文加载失败');
+                        }
+                    }, 5000); // 每5秒一次
+                },
+
+                stopPolling() {
+                    if (this.pollInterval) {
+                        clearInterval(this.pollInterval);
+                        this.pollInterval = null;
+                    }
+                    this.loadingContent = false;
+                },
+
+                async submitPrediction() {
+                    if (this.form.positionSize === null) {
+                        alert('虚拟仓位为反脆弱训练核心指标，必须填写！');
+                        return;
+                    }
+                    if (!this.form.targetDate) {
+                        alert('请选择预期兑现日');
+                        return;
+                    }
+                    const payload = {
+                        news_id: parseInt(id),
+                        extracted_facts: this.form.extractedFacts || null,
+                        inference: this.form.inference,
+                        probability: this.form.probability,
+                        position_size_pct: this.form.positionSize,
+                        target_date: this.form.targetDate,
+                        rule_json: { type: this.form.ruleType }
+                    };
+                    const headers = {
+                        'Content-Type': 'application/json',
+                        ...Auth.getHeaders()
+                    };
+                    const res = await fetch('/api/predictions', {
+                        method: 'POST',
+                        headers,
+                        body: JSON.stringify(payload)
+                    });
+                    if (res.ok) {
+                        alert('预测提交成功！');
+                        // 折叠表单
+                        const formContainer = document.querySelector('[x-data="{ showForm: false }"]');
+                        if (formContainer && formContainer.__x) {
+                            formContainer.__x.$data.showForm = false;
+                        }
+                    } else {
+                        const err = await res.text();
+                        alert('提交失败: ' + err);
+                    }
+                }
+            }
+        }
+    </script>
+</body>
+</html>

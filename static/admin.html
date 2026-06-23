@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>管理员面板 - 全球新闻阅读影响趋势预测</title>
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="/js/auth.js"></script>
+</head>
+<body class="bg-gray-100">
+    <div x-data="adminApp()" x-init="init()" class="container mx-auto p-4">
+        <!-- 导航 -->
+        <nav class="bg-white shadow mb-6 p-4 rounded-lg flex justify-between items-center">
+            <h1 class="text-2xl font-bold text-blue-800">🔧 管理员面板</h1>
+            <div class="space-x-4">
+                <a href="/" class="text-blue-600 hover:underline">首页</a>
+                <a href="/stats.html" class="text-blue-600 hover:underline">统计</a>
+                <button @click="logout" class="bg-red-500 hover:bg-red-600 text-white px-3 py-1 rounded text-sm">退出</button>
+            </div>
+        </nav>
+
+        <!-- Tab切换 -->
+        <div class="bg-white rounded-lg shadow p-4 mb-6">
+            <div class="flex space-x-4 border-b pb-2">
+                <button @click="tab='sources'" :class="{'font-bold text-blue-600 border-b-2 border-blue-600': tab==='sources'}" class="px-4 py-2">📰 新闻源管理</button>
+                <button @click="tab='exclude'" :class="{'font-bold text-blue-600 border-b-2 border-blue-600': tab==='exclude'}" class="px-4 py-2">🔇 排除词库</button>
+            </div>
+
+            <!-- 新闻源管理 -->
+            <div x-show="tab==='sources'" x-cloak class="mt-4">
+                <div class="flex justify-between items-center mb-4">
+                    <h2 class="text-xl font-semibold">新闻源列表</h2>
+                    <button @click="openAddModal()" class="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded text-sm">+ 添加源</button>
+                </div>
+                <div class="overflow-x-auto">
+                    <table class="min-w-full divide-y divide-gray-200">
+                        <thead class="bg-gray-50">
+                            <tr>
+                                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500">ID</th>
+                                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500">名称</th>
+                                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500">URL</th>
+                                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500">类型</th>
+                                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500">间隔(秒)</th>
+                                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500">启用</th>
+                                <th class="px-4 py-2 text-left text-xs font-medium text-gray-500">操作</th>
+                            </tr>
+                        </thead>
+                        <tbody class="divide-y divide-gray-200">
+                            <template x-for="source in sources" :key="source.id">
+                                <tr>
+                                    <td class="px-4 py-2" x-text="source.id"></td>
+                                    <td class="px-4 py-2" x-text="source.name"></td>
+                                    <td class="px-4 py-2 max-w-xs truncate" x-text="source.url"></td>
+                                    <td class="px-4 py-2" x-text="source.feed_type"></td>
+                                    <td class="px-4 py-2" x-text="source.refresh_interval_sec"></td>
+                                    <td class="px-4 py-2">
+                                        <span :class="{'text-green-600': source.enabled, 'text-red-600': !source.enabled}" x-text="source.enabled ? '✅' : '❌'"></span>
+                                    </td>
+                                    <td class="px-4 py-2 space-x-1">
+                                        <button @click="openEditModal(source)" class="text-blue-600 hover:underline text-sm">编辑</button>
+                                        <button @click="deleteSource(source.id)" class="text-red-600 hover:underline text-sm">删除</button>
+                                    </td>
+                                </tr>
+                            </template>
+                            <tr x-show="sources.length === 0">
+                                <td colspan="7" class="px-4 py-4 text-center text-gray-500">暂无新闻源</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- 排除词库 -->
+            <div x-show="tab==='exclude'" x-cloak class="mt-4">
+                <h2 class="text-xl font-semibold mb-4">动态排除词库</h2>
+                <div class="flex flex-wrap gap-2 p-4 bg-gray-50 rounded-lg min-h-20">
+                    <template x-for="word in excludeWords" :key="word">
+                        <span class="bg-red-100 text-red-800 px-3 py-1 rounded-full text-sm flex items-center">
+                            <span x-text="word"></span>
+                            <button @click="removeExcludeWord(word)" class="ml-2 text-red-600 hover:text-red-800">×</button>
+                        </span>
+                    </template>
+                    <span x-show="excludeWords.length === 0" class="text-gray-400">暂无排除词</span>
+                </div>
+                <div class="mt-4 flex">
+                    <input x-model="newExcludeWord" type="text" placeholder="输入新排除词" class="border rounded-l px-3 py-1 flex-1">
+                    <button @click="addExcludeWord()" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-1 rounded-r">添加</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- ========= 模态框：添加/编辑源 ========= -->
+        <div x-show="showModal" x-cloak class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+            <div class="bg-white rounded-lg max-w-2xl w-full p-6 max-h-screen overflow-y-auto">
+                <h2 class="text-xl font-bold mb-4" x-text="editingId ? '编辑新闻源' : '添加新闻源'"></h2>
+                <form @submit.prevent="saveSource()">
+                    <div class="grid grid-cols-2 gap-4">
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700">名称 *</label>
+                            <input x-model="form.name" type="text" required class="w-full border rounded px-2 py-1">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700">URL *</label>
+                            <input x-model="form.url" type="url" required class="w-full border rounded px-2 py-1">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700">类型 *</label>
+                            <select x-model="form.feed_type" class="w-full border rounded px-2 py-1">
+                                <option value="rss">RSS</option>
+                                <option value="atom">Atom</option>
+                                <option value="api">API</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700">刷新间隔（秒）</label>
+                            <input x-model="form.refresh_interval_sec" type="number" min="60" class="w-full border rounded px-2 py-1">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700">启用</label>
+                            <select x-model="form.enabled" class="w-full border rounded px-2 py-1">
+                                <option :value="true">是</option>
+                                <option :value="false">否</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="mt-4">
+                        <label class="block text-sm font-medium text-gray-700">包含关键词（逗号分隔）</label>
+                        <input x-model="form.require_keywords_str" type="text" class="w-full border rounded px-2 py-1" placeholder="例如：财经, 股市">
+                    </div>
+                    <div class="mt-2">
+                        <label class="block text-sm font-medium text-gray-700">排除关键词（逗号分隔）</label>
+                        <input x-model="form.exclude_keywords_str" type="text" class="w-full border rounded px-2 py-1" placeholder="例如：广告, 推广">
+                    </div>
+                    <div class="mt-6 flex justify-end space-x-2">
+                        <button type="button" @click="closeModal()" class="bg-gray-300 hover:bg-gray-400 px-4 py-2 rounded">取消</button>
+                        <button type="submit" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded" x-text="editingId ? '更新' : '创建'"></button>
+                    </div>
+                </form>
+            </div>
+        </div>
+        <style>
+            [x-cloak] { display: none !important; }
+        </style>
+    </div>
+
+    <script>
+        function adminApp() {
+            return {
+                tab: 'sources',
+                sources: [],
+                excludeWords: [],
+                showModal: false,
+                editingId: null,
+                newExcludeWord: '',
+                form: {
+                    name: '',
+                    url: '',
+                    feed_type: 'rss',
+                    refresh_interval_sec: 300,
+                    enabled: true,
+                    require_keywords_str: '',
+                    exclude_keywords_str: '',
+                },
+                async init() {
+                    Auth.requireAuth();
+                    await this.loadSources();
+                    await this.loadExcludeWords();
+                },
+                async loadSources() {
+                    const res = await fetch('/api/admin/sources', { headers: Auth.getHeaders() });
+                    if (res.ok) {
+                        this.sources = await res.json();
+                    } else if (res.status === 401) {
+                        Auth.logout();
+                    }
+                },
+                async loadExcludeWords() {
+                    const res = await fetch('/api/admin/exclude-words', { headers: Auth.getHeaders() });
+                    if (res.ok) {
+                        this.excludeWords = await res.json();
+                    }
+                },
+                openAddModal() {
+                    this.editingId = null;
+                    this.form = {
+                        name: '',
+                        url: '',
+                        feed_type: 'rss',
+                        refresh_interval_sec: 300,
+                        enabled: true,
+                        require_keywords_str: '',
+                        exclude_keywords_str: '',
+                    };
+                    this.showModal = true;
+                },
+                openEditModal(source) {
+                    this.editingId = source.id;
+                    this.form = {
+                        name: source.name,
+                        url: source.url,
+                        feed_type: source.feed_type,
+                        refresh_interval_sec: source.refresh_interval_sec,
+                        enabled: source.enabled,
+                        require_keywords_str: source.require_keywords.join(', '),
+                        exclude_keywords_str: source.exclude_keywords.join(', '),
+                    };
+                    this.showModal = true;
+                },
+                closeModal() {
+                    this.showModal = false;
+                },
+                async saveSource() {
+                    const payload = {
+                        name: this.form.name,
+                        url: this.form.url,
+                        feed_type: this.form.feed_type,
+                        refresh_interval_sec: parseInt(this.form.refresh_interval_sec) || 300,
+                        enabled: this.form.enabled,
+                        require_keywords: this.form.require_keywords_str.split(',').map(s => s.trim()).filter(Boolean),
+                        exclude_keywords: this.form.exclude_keywords_str.split(',').map(s => s.trim()).filter(Boolean),
+                    };
+                    const url = this.editingId ? `/api/admin/sources/${this.editingId}` : '/api/admin/sources';
+                    const method = this.editingId ? 'PUT' : 'POST';
+                    const res = await fetch(url, {
+                        method,
+                        headers: { 'Content-Type': 'application/json', ...Auth.getHeaders() },
+                        body: JSON.stringify(payload),
+                    });
+                    if (res.ok) {
+                        this.closeModal();
+                        await this.loadSources();
+                        await this.loadExcludeWords(); // 排除词可能变化
+                    } else {
+                        alert('操作失败');
+                    }
+                },
+                async deleteSource(id) {
+                    if (!confirm('确认删除该新闻源吗？')) return;
+                    const res = await fetch(`/api/admin/sources/${id}`, {
+                        method: 'DELETE',
+                        headers: Auth.getHeaders(),
+                    });
+                    if (res.ok) {
+                        await this.loadSources();
+                        await this.loadExcludeWords();
+                    } else {
+                        alert('删除失败');
+                    }
+                },
+                async addExcludeWord() {
+                    if (!this.newExcludeWord.trim()) return;
+                    // 此处仅为前端演示，实际添加到排除词库需要更新源或专门接口
+                    // 简单起见，我们模拟添加到第一个源的 exclude_keywords
+                    if (this.sources.length === 0) {
+                        alert('请先添加新闻源');
+                        return;
+                    }
+                    const firstSource = this.sources[0];
+                    const newExclude = [...firstSource.exclude_keywords, this.newExcludeWord.trim()];
+                    const res = await fetch(`/api/admin/sources/${firstSource.id}`, {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json', ...Auth.getHeaders() },
+                        body: JSON.stringify({ exclude_keywords: newExclude }),
+                    });
+                    if (res.ok) {
+                        this.newExcludeWord = '';
+                        await this.loadSources();
+                        await this.loadExcludeWords();
+                    } else {
+                        alert('添加失败');
+                    }
+                },
+                async removeExcludeWord(word) {
+                    if (!confirm(`确认移除排除词 "${word}"？`)) return;
+                    // 从所有源中移除该词
+                    for (const source of this.sources) {
+                        const newExclude = source.exclude_keywords.filter(w => w !== word);
+                        await fetch(`/api/admin/sources/${source.id}`, {
+                            method: 'PUT',
+                            headers: { 'Content-Type': 'application/json', ...Auth.getHeaders() },
+                            body: JSON.stringify({ exclude_keywords: newExclude }),
+                        });
+                    }
+                    await this.loadSources();
+                    await this.loadExcludeWords();
+                },
+                logout() {
+                    Auth.logout();
+                }
+            }
+        }
+    </script>
+</body>
+</html>
