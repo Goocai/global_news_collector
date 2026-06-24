@@ -4,9 +4,6 @@ use reqwest::Client;
 use rss::Channel;
 use chrono::{DateTime, Utc, FixedOffset};
 use tracing::{info,warn};
-use scraper::{Html,Selector};
-use legible::{parse,Options};
-use std::time::Duration;
 use crate::collector::DynamicExcludeWords;
 
 
@@ -136,47 +133,3 @@ pub async fn fetch_and_store(
 }
 
 
-
-/// 从新闻链接抓取 HTML 并提取正文（净化后）
-pub async fn fetch_full_content(client: &Client, url: &str) -> Option<String> {
-    let resp = client.get(url).timeout(Duration::from_secs(10)).send().await.ok()?;
-    let html = resp.text().await.ok()?;
-
-    // 1. 尝试使用 legible 提取
-    let options = Options::new()
-        .char_threshold(200)    // 适应中文短文章
-        .keep_classes(false);   // 不需要 CSS 类
-
-    if let Ok(article) = parse(&html, Some(url), Some(options)) {
-        let content_html = article.content;
-        if content_html.len() > 100 {
-            // 净化 HTML，避免 XSS
-            let clean_html = ammonia::clean(&content_html);
-            return Some(clean_html);
-        }
-    }
-
-    // 2. 回退方案：提取所有 <p> 标签
-    let document = Html::parse_document(&html);
-    let p_selector = match Selector::parse("p") {
-        Ok(s) => s,
-        Err(_) => return None,
-    };
-    let paragraphs: Vec<String> = document
-        .select(&p_selector)
-        .map(|el| el.text().collect::<String>())
-        .filter(|text| text.len() > 20)
-        .collect();
-
-    if paragraphs.is_empty() {
-        None
-    } else {
-        let raw_html = paragraphs
-            .iter()
-            .map(|p| format!("<p>{}</p>", p))
-            .collect::<Vec<_>>()
-            .join("\n");
-        // 对回退内容也进行净化
-        Some(ammonia::clean(&raw_html))
-    }
-}

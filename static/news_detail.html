@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -19,27 +18,16 @@
                 <span x-text="news.published_at ? new Date(news.published_at).toLocaleString() : ''"></span>
             </div>
 
-            <!-- 摘要区域（summary） -->
+            <!-- 摘要区域 -->
             <div class="mb-4 text-gray-700 border-l-4 border-blue-300 pl-4 italic" x-show="news.summary">
                 <p class="text-sm font-semibold text-gray-500">📌 摘要</p>
                 <p x-text="news.summary"></p>
             </div>
 
-            <!-- 正文区域（content） -->
-            <div class="prose max-w-none" x-show="news.content && !loadingContent">
+            <!-- 正文区域 -->
+            <div class="prose max-w-none" x-show="news.content">
                 <p class="text-sm font-semibold text-gray-500 mb-1">📄 正文</p>
                 <div x-html="news.content"></div>
-            </div>
-
-            <!-- 正文加载中提示 -->
-            <div class="text-blue-500 italic" x-show="news.fetching || loadingContent">
-                🔄 正在加载正文，请稍后...
-            </div>
-
-
-            <!-- 当两者都为空时的备用提示 -->
-            <div class="text-gray-500 italic" x-show="!news.summary && !news.content && !loadingContent">
-                暂无摘要或正文，请点击原文链接查看。
             </div>
 
             <div class="mt-6 pt-4 border-t">
@@ -47,7 +35,7 @@
             </div>
         </div>
 
-        <!-- ========= 推演表单区域 (默认折叠，点击展开) ========= -->
+        <!-- ========= 推演表单区域 ========= -->
         <div class="mt-8 bg-white rounded-lg shadow" x-data="{ showForm: false }">
             <button @click="showForm = !showForm" 
                     class="w-full text-left px-6 py-3 bg-gray-50 hover:bg-gray-100 rounded-t-lg font-semibold flex justify-between items-center">
@@ -56,7 +44,7 @@
             </button>
             <div x-show="showForm" x-cloak class="p-6 border-t">
                 <form @submit.prevent="submitPrediction">
-                    <!-- 摘取事实 (可选) -->
+                    <!-- 摘取事实 -->
                     <div class="mb-4">
                         <label class="block text-gray-700 font-medium mb-2">摘取事实</label>
                         <textarea x-model="form.extractedFacts" rows="2"
@@ -72,11 +60,11 @@
 
                     <!-- 主观胜率滑块 -->
                     <div class="mb-4">
-                        <label class="block text-gray-700 font-medium mb-2">主观胜率: <span x-text="form.probability"></span>%</label>
+                        <label class="block text-gray-700 font-medium mb-2">主观胜率: <span x-text="form.probability"></span>% <span class="text-red-500">*</span></label>
                         <input type="range" x-model="form.probability" min="0" max="100" class="w-full">
                     </div>
 
-                    <!-- 虚拟仓位滑块 (必填，强校验) -->
+                    <!-- 虚拟仓位滑块 (必填) -->
                     <div class="mb-4">
                         <label class="block text-gray-700 font-medium mb-2">
                             虚拟仓位 <span class="text-red-500">*</span>
@@ -86,23 +74,75 @@
                         <div class="text-center text-sm text-gray-500 mt-1" x-text="form.positionSize !== null ? form.positionSize + '%' : '未选择'"></div>
                     </div>
 
-                    <!-- 预期兑现日 (必填，最小 UTC+1) -->
+                    <!-- 预期兑现日 (必填) -->
                     <div class="mb-4">
                         <label class="block text-gray-700 font-medium mb-2">预期兑现日 <span class="text-red-500">*</span></label>
                         <input type="date" x-model="form.targetDate" :min="minDate" required
                                class="w-full border rounded px-3 py-2">
                     </div>
 
-                    <!-- 判定规则模板简化版 -->
-                    <div class="mb-6">
-                        <label class="block text-gray-700 font-medium mb-2">判定规则</label>
+                    <!-- 判定规则类型 -->
+                    <div class="mb-4">
+                        <label class="block text-gray-700 font-medium mb-2">判定规则 <span class="text-red-500">*</span></label>
                         <select x-model="form.ruleType" class="w-full border rounded px-3 py-2">
-                            <option value="price_change">价格涨跌幅</option>
-                            <option value="central_bank">央行利率决议</option>
-                            <option value="url_keyword">URL关键词检测</option>
-                            <option value="economic_data">经济数据对比</option>
+                            <option v-for="(def, key) in RULE_TYPE" :value="key" x-text="def.label"></option>
                         </select>
                     </div>
+
+                    <!-- 动态规则参数字段 -->
+                    <template x-for="field in RULE_TYPE[form.ruleType].fields" :key="field.name">
+                        <div class="mb-4" x-show="!field.depends_on || ruleData[field.depends_on.field] === field.depends_on.value">
+                            <label class="block text-gray-700 font-medium mb-2">
+                                <span x-text="field.label"></span>
+                                <span class="text-red-500" x-show="field.required">*</span>
+                            </label>
+
+                            <!-- 选择框 -->
+                            <select x-if="field.type === 'string' && field.options"
+                                    x-model="ruleData[field.name]"
+                                    class="w-full border rounded px-3 py-2">
+                                <option v-for="opt in field.options" :value="opt" x-text="opt"></option>
+                            </select>
+
+                            <!-- 文本输入 (字符串) -->
+                            <input x-if="field.type === 'string' && !field.options"
+                                   type="text"
+                                   x-model="ruleData[field.name]"
+                                   :required="field.required"
+                                   :placeholder="field.placeholder || ''"
+                                   class="w-full border rounded px-3 py-2">
+
+                            <!-- 数字输入 -->
+                            <input x-if="field.type === 'number'"
+                                   type="number"
+                                   x-model="ruleData[field.name]"
+                                   :required="field.required"
+                                   :min="field.min || 0"
+                                   :step="field.step || 'any'"
+                                   class="w-full border rounded px-3 py-2">
+
+                            <!-- 日期输入 -->
+                            <input x-if="field.type === 'date'"
+                                   type="date"
+                                   x-model="ruleData[field.name]"
+                                   :required="field.required"
+                                   class="w-full border rounded px-3 py-2">
+
+                            <!-- 布尔值 (checkbox) -->
+                            <div x-if="field.type === 'boolean'" class="flex items-center">
+                                <input type="checkbox" x-model="ruleData[field.name]" class="mr-2">
+                                <span>是</span>
+                            </div>
+
+                            <!-- 数组输入 (简单实现为逗号分隔) -->
+                            <input x-if="field.type === 'array'"
+                                   type="text"
+                                   x-model="ruleData[field.name]"
+                                   :required="field.required"
+                                   placeholder="用逗号分隔，例如: keyword1,keyword2"
+                                   class="w-full border rounded px-3 py-2">
+                        </div>
+                    </template>
 
                     <button type="submit" class="bg-green-600 hover:bg-green-700 text-white px-6 py-2 rounded-lg font-semibold">
                         提交预测
@@ -114,12 +154,76 @@
             [x-cloak] { display: none !important; }
         </style>
     </div>
+
     <script>
         function newsDetail() {
+            const RULE_TYPE = {
+                "price_change": {
+                    "label": "价格涨跌幅",
+                    "fields": [
+                        { "name": "symbol", "type": "string", "required": true, "label": "股票代码" },
+                        { "name": "market", "type": "string", "required": true, "label": "市场", "options": ["us","hk","cn"] },
+                        { "name": "base_date", "type": "date", "required": true, "label": "基准日期" },
+                        { "name": "observation_date", "type": "date", "required": true, "label": "观察日期" },
+                        { "name": "threshold_percent", "type": "number", "required": true, "label": "阈值百分比", "min": 0 },
+                        { "name": "direction", "type": "string", "required": true, "label": "方向", "options": ["greater","less"] }
+                    ]
+                },
+                "central_bank": {
+                    "label": "央行利率决议",
+                    "fields": [
+                        { "name": "bank", "type": "string", "required": true, "label": "央行", "options": ["fomc","ecb","boj","pboc"] },
+                        { "name": "meeting_date", "type": "date", "required": true, "label": "会议日期" },
+                        { "name": "expected_action", "type": "string", "required": true, "label": "预期行动", "options": ["hike_25bp","hold","cut_25bp"] }
+                    ]
+                },
+                "url_keyword": {
+                    "label": "URL关键词检测",
+                    "fields": [
+                        { "name": "url", "type": "string", "required": true, "label": "目标 URL" },
+                        { "name": "keywords", "type": "array", "required": true, "label": "关键词列表" },
+                        { "name": "match_all", "type": "boolean", "required": true, "label": "全部匹配" }
+                    ]
+                },
+                "economic_data": {
+                    "label": "经济数据对比",
+                    "fields": [
+                        { "name": "indicator", "type": "string", "required": true, "label": "指标", "options": ["cpi","gdp","nonfarm"] },
+                        { "name": "country", "type": "string", "required": true, "label": "国家" },
+                        { "name": "release_date", "type": "date", "required": true, "label": "发布日期" },
+                        { "name": "expected_value", "type": "number", "required": true, "label": "预期值" },
+                        { "name": "operator", "type": "string", "required": true, "label": "比较符", "options": ["greater","less","equal"] },
+                        { "name": "actual_value_source", "type": "string", "required": true, "label": "实际值来源", "options": ["manual","api"] },
+                        { "name": "actual_value", "type": "number", "required": false, "label": "实际值（手动）", "depends_on": { "field": "actual_value_source", "value": "manual" } }
+                    ]
+                },
+                "earnings": {
+                    "label": "财报业绩",
+                    "fields": [
+                        { "name": "symbol", "type": "string", "required": true, "label": "股票代码" },
+                        { "name": "market", "type": "string", "required": true, "label": "市场", "options": ["us","hk","cn"] },
+                        { "name": "quarter", "type": "string", "required": true, "label": "季度", "placeholder": "2026Q2" },
+                        { "name": "expected_eps", "type": "number", "required": true, "label": "预期每股收益" },
+                        { "name": "actual_eps_source", "type": "string", "required": true, "label": "实际值来源", "options": ["manual","api"] },
+                        { "name": "actual_eps", "type": "number", "required": false, "label": "实际每股收益（手动）", "depends_on": { "field": "actual_eps_source", "value": "manual" } }
+                    ]
+                },
+                "commodity": {
+                    "label": "大宗商品价格",
+                    "fields": [
+                        { "name": "symbol", "type": "string", "required": true, "label": "商品代码", "placeholder": "CL=F" },
+                        { "name": "market", "type": "string", "required": true, "label": "市场", "options": ["us","hk","cn"] },
+                        { "name": "base_date", "type": "date", "required": true, "label": "基准日期" },
+                        { "name": "observation_date", "type": "date", "required": true, "label": "观察日期" },
+                        { "name": "threshold_percent", "type": "number", "required": true, "label": "阈值百分比", "min": 0 },
+                        { "name": "direction", "type": "string", "required": true, "label": "方向", "options": ["greater","less"] }
+                    ]
+                }
+            };
+
             const urlParams = new URLSearchParams(window.location.search);
             const id = urlParams.get('id');
 
-            // 计算 UTC 日期+1 作为最小可选的 target_date
             const tomorrow = new Date();
             tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
             const minDate = tomorrow.toISOString().split('T')[0];
@@ -134,69 +238,46 @@
                     targetDate: '',
                     ruleType: 'price_change'
                 },
+                ruleData: {},   // 存储动态规则字段的值
+                RULE_TYPE: RULE_TYPE,
                 minDate: minDate,
-                loadingContent: false,
-                pollCount: 0,
-                maxPollCount: 12,           // 最多12次
-                pollInterval: null,
 
                 async init() {
                     Auth.requireAuth();
                     await this.loadNews();
+                    // 初始化 ruleData 为所有字段准备空值
+                    this.initRuleData();
+                },
+
+                initRuleData() {
+                    // 遍历所有规则类型，为每个字段初始化空值
+                    for (const [type, def] of Object.entries(this.RULE_TYPE)) {
+                        for (const field of def.fields) {
+                            if (!this.ruleData[field.name]) {
+                                if (field.type === 'boolean') {
+                                    this.ruleData[field.name] = false;
+                                } else if (field.type === 'array') {
+                                    this.ruleData[field.name] = '';
+                                } else {
+                                    this.ruleData[field.name] = '';
+                                }
+                            }
+                        }
+                    }
                 },
 
                 async loadNews() {
                     const headers = { ...Auth.getHeaders() };
                     const res = await fetch(`/api/news/${id}`, { headers });
                     if (res.ok) {
-                        const data = await res.json();
-                        this.news = data;
-                        // 如果 content 为空且（正在抓取 或 尚未开始轮询）且未超限，启动轮询
-                        if (!this.news.content && (this.news.fetching || !this.loadingContent) && this.pollCount < this.maxPollCount) {
-                            this.startPolling();
-                        }
+                        this.news = await res.json();
                     } else {
-                        this.news = { title: '加载失败', content: '无法获取新闻详情' };
+                        this.news = { title: '加载失败', description: '无法获取新闻详情' };
                     }
-                },
-
-                startPolling() {
-                    this.loadingContent = true;
-                    this.pollInterval = setInterval(async () => {
-                        this.pollCount++;
-                        const headers = { ...Auth.getHeaders() };
-                        const res = await fetch(`/api/news/${id}`, { headers });
-                        if (res.ok) {
-                            const data = await res.json();
-                            this.news = data;
-                            if (this.news.content) {
-                                // 获取到正文，停止轮询
-                                this.stopPolling();
-                            } else if (!this.news.fetching) {
-                                // 后端不再抓取但内容仍为空 → 抓取失败
-                                this.stopPolling();
-                                alert('正文加载失败，请稍后刷新');
-                            } else if (this.pollCount >= this.maxPollCount) {
-                                // 超过最大次数
-                                this.stopPolling();
-                                alert('正文加载超时，请稍后刷新');
-                            }
-                        } else {
-                            this.stopPolling();
-                            alert('正文加载失败');
-                        }
-                    }, 5000); // 每5秒一次
-                },
-
-                stopPolling() {
-                    if (this.pollInterval) {
-                        clearInterval(this.pollInterval);
-                        this.pollInterval = null;
-                    }
-                    this.loadingContent = false;
                 },
 
                 async submitPrediction() {
+                    // 基本验证
                     if (this.form.positionSize === null) {
                         alert('虚拟仓位为反脆弱训练核心指标，必须填写！');
                         return;
@@ -205,6 +286,42 @@
                         alert('请选择预期兑现日');
                         return;
                     }
+                    if (!this.form.inference.trim()) {
+                        alert('逻辑推演不能为空');
+                        return;
+                    }
+
+                    // 构建规则对象
+                    const ruleType = this.form.ruleType;
+                    const ruleDef = this.RULE_TYPE[ruleType];
+                    const ruleJson = { type: ruleType };
+
+                    // 收集当前规则类型的所有字段值
+                    for (const field of ruleDef.fields) {
+                        const value = this.ruleData[field.name];
+                        // 对于数组类型，将逗号分隔字符串转为数组
+                        if (field.type === 'array' && typeof value === 'string') {
+                            ruleJson[field.name] = value.split(',').map(s => s.trim()).filter(s => s);
+                        } else if (field.type === 'boolean') {
+                            ruleJson[field.name] = value === true || value === 'true';
+                        } else if (field.type === 'number') {
+                            ruleJson[field.name] = parseFloat(value) || 0;
+                        } else {
+                            ruleJson[field.name] = value;
+                        }
+                    }
+
+                    // 检查必填字段是否都有值（简单检查）
+                    for (const field of ruleDef.fields) {
+                        if (field.required) {
+                            const val = ruleJson[field.name];
+                            if (val === undefined || val === null || val === '' || (Array.isArray(val) && val.length === 0)) {
+                                alert(`请填写完整规则参数: ${field.label}`);
+                                return;
+                            }
+                        }
+                    }
+
                     const payload = {
                         news_id: parseInt(id),
                         extracted_facts: this.form.extractedFacts || null,
@@ -212,8 +329,9 @@
                         probability: this.form.probability,
                         position_size_pct: this.form.positionSize,
                         target_date: this.form.targetDate,
-                        rule_json: { type: this.form.ruleType }
+                        rule_json: ruleJson
                     };
+
                     const headers = {
                         'Content-Type': 'application/json',
                         ...Auth.getHeaders()
@@ -225,7 +343,7 @@
                     });
                     if (res.ok) {
                         alert('预测提交成功！');
-                        // 折叠表单
+                        // 重置表单或折叠
                         const formContainer = document.querySelector('[x-data="{ showForm: false }"]');
                         if (formContainer && formContainer.__x) {
                             formContainer.__x.$data.showForm = false;

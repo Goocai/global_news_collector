@@ -5,7 +5,7 @@ use sqlx::PgPool;
 use chrono::NaiveDate;
 use tracing::error;
 use crate::auth::extractor::AuthUser;
-
+use serde_json::Value as JsonValue;
 
 pub fn routes() -> Router<PgPool> {
     Router::new()
@@ -19,15 +19,15 @@ pub fn routes() -> Router<PgPool> {
 
 #[derive(Deserialize)]
 pub struct OverrideRequest {
-    outcome: i32, // 0 或 1
+    outcome_human: i32, // 0 或 1
+    outcome_llm: i32, // 0 或 1
 }
 
 #[derive(Serialize)]
 pub struct FailedPredictionItem {
     id: i32,
     news_title: String,
-    inference: String,
-    probability: String, // BigDecimal 转字符串
+    rule_json: JsonValue,   
     target_date: NaiveDate,
 }
 
@@ -35,68 +35,79 @@ pub struct FailedPredictionItem {
 // 获取所有 failed_api 状态且未判决的预测
 async fn list_failed_predictions(
     State(pool): State<PgPool>,
-) -> Json<Vec<FailedPredictionItem>> {
+) -> Result<Json<Vec<FailedPredictionItem>>, StatusCode> {
     let rows = sqlx::query!(
         r#"
-        SELECT p.id, n.title as news_title, p.inference, p.probability, p.target_date
-        FROM predictions p
+        SELECT p.id, n.title as news_title, p.rule_json, p.target_date
+        FROM prediction_tasks p
         JOIN news n ON p.news_id = n.id
-        WHERE p.judge_status = 'failed_api' AND p.outcome IS NULL
+        WHERE p.judge_status = 'failed_api' 
+          AND p.outcome_human IS NULL 
+          AND p.outcome_llm IS NULL
         ORDER BY p.submitted_at DESC
         "#
     )
     .fetch_all(&pool)
     .await
-    .unwrap_or_else(|_| vec![]);
+    .map_err(|e| {
+        error!("查询失败预测列表失败: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     let items = rows
         .into_iter()
         .map(|row| FailedPredictionItem {
             id: row.id,
             news_title: row.news_title,
-            inference: row.inference,
-            probability: row.probability.to_string(), // BigDecimal -> String
+            rule_json: row.rule_json,   // 直接使用 serde_json::Value
             target_date: row.target_date,
         })
         .collect();
-    Json(items)
+    Ok(Json(items))
 }
 
 // 覆盖预测结果（管理员专用）
 async fn override_prediction(
     State(pool): State<PgPool>,
-    auth_user:AuthUser,
-    axum::extract::Path(id): axum::extract::Path<i32>,
+    auth_user: AuthUser,
+    Path(id): Path<i32>,
     Json(payload): Json<OverrideRequest>,
 ) -> StatusCode {
-
     if auth_user.role != "admin" {
         return StatusCode::FORBIDDEN;
     }
-    
-    if payload.outcome != 0 && payload.outcome != 1 {
+
+    // 使用 matches! 更简洁
+    if !matches!(payload.outcome_human, 0 | 1) || !matches!(payload.outcome_llm, 0 | 1) {
         return StatusCode::BAD_REQUEST;
     }
+
     let result = sqlx::query!(
         r#"
-        UPDATE predictions
-        SET outcome = $1, judge_status = 'resolved', verified_at = NOW()
-        WHERE id = $2 AND judge_status = 'failed_api' AND outcome IS NULL
+        UPDATE prediction_tasks
+        SET outcome_human = $1, outcome_llm = $2, judge_status = 'resolved', verified_at = NOW()
+        WHERE id = $3 
+          AND judge_status = 'failed_api' 
+          AND (outcome_human IS NULL OR outcome_llm IS NULL)
         "#,
-        payload.outcome,
+        payload.outcome_human,
+        payload.outcome_llm,
         id
     )
     .execute(&pool)
     .await;
+
     match result {
         Ok(rows) if rows.rows_affected() == 1 => StatusCode::OK,
-        Ok(_) => StatusCode::NOT_FOUND,
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        Ok(_) => StatusCode::NOT_FOUND,   // 或考虑返回 409 表示不可更新
+        Err(e) => {
+            error!("覆盖预测失败: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
     }
 }
 
-
-// ---------- Sources 管理 请求/响应结构 ----------
+// ---------- sources 管理 请求/响应结构 ----------
 #[derive(Deserialize)]
 pub struct CreateSourceRequest {
     pub name: String,

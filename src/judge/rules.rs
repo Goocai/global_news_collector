@@ -1,177 +1,276 @@
-use async_trait::async_trait;
 use serde_json::Value;
 use sqlx::PgPool;
 use std::error::Error;
-use reqwest::Client;
-use chrono::{ NaiveDate};
+use reqwest::{Client,Url};
+use chrono::{NaiveDate, Duration, Datelike};  // 添加 Datelike
 use std::env;
+use serde::{Deserialize, Serialize};
+use tracing::info;   // 只保留 info
+use std::sync::{Arc, LazyLock};  // 使用 LazyLock
+use tokio::sync::Mutex;
+use regex::Regex;
 
 use crate::cache::{get_cached_response, set_cached_response};
 
-/// 统一判定器错误类型（可扩展）
-pub type RuleResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
+// ========== 规则枚举定义 ==========
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum Rule {
+    #[serde(rename = "price_change")]
+    PriceChange {
+        symbol: String,
+        market: String,
+        base_date: NaiveDate,
+        observation_date: NaiveDate,
+        threshold_percent: f64,
+        direction: String,
+    },
 
-#[async_trait]
-pub trait RuleVerifier: Send + Sync {
-    async fn verify(&self, rule: &Value, pool: &PgPool) -> RuleResult<bool>;
+    #[serde(rename = "central_bank")]
+    CentralBank {
+        bank: String,
+        meeting_date: NaiveDate,
+        expected_action: String,
+    },
+
+    #[serde(rename = "url_keyword")]
+    UrlKeyword {
+        url: String,
+        keywords: Vec<String>,
+        match_all: bool,
+    },
+
+    #[serde(rename = "economic_data")]
+    EconomicData {
+        indicator: String,
+        country: String,
+        release_date: NaiveDate,
+        expected_value: f64,
+        operator: String,
+        actual_value_source: String,
+        actual_value: Option<f64>,
+    },
+
+    #[serde(rename = "earnings")]
+    Earnings {
+        symbol: String,
+        market: String,
+        quarter: String,
+        expected_eps: f64,
+        actual_eps_source: String,
+        actual_eps: Option<f64>,
+    },
+
+    #[serde(rename = "commodity")]
+    Commodity {
+        symbol: String,
+        market: String,
+        base_date: NaiveDate,
+        observation_date: NaiveDate,
+        threshold_percent: f64,
+        direction: String,
+    },
 }
 
-/// 价格涨跌幅判定器
-pub struct PriceChangeVerifier;
+// ========== 核心判定函数 ==========
+pub async fn evaluate_rule(rule: &Rule, pool: &PgPool) -> Result<bool, Box<dyn Error + Send + Sync>> {
+    match rule {
+        Rule::PriceChange { symbol, base_date, observation_date, threshold_percent, direction, .. } => {
+            let change = fetch_price_change(pool, symbol, base_date, observation_date).await?;
+            let satisfied = match direction.as_str() {
+                "greater" => change >= *threshold_percent,
+                "less" => change <= *threshold_percent,
+                _ => false,
+            };
+            info!(
+                "价格判定: {} 涨跌幅 {:.2}% (阈值 {} {}) -> {}",
+                symbol, change, direction, threshold_percent, satisfied
+            );
+            Ok(satisfied)
+        }
 
-#[async_trait]
-impl RuleVerifier for PriceChangeVerifier {
-    async fn verify(&self, rule: &Value, pool: &PgPool) -> RuleResult<bool> {
-        let symbol = rule["symbol"].as_str().unwrap_or("AAPL");
-        let base_date_str = rule["base_date"].as_str().unwrap_or("");
-        let observation_date_str = rule["observation_date"].as_str().unwrap_or("");
-        let threshold = rule["threshold_percent"].as_f64().unwrap_or(5.0);
-        let direction = rule["direction"].as_str().unwrap_or("greater");
+        Rule::CentralBank { bank, meeting_date, expected_action } => {
+            let actual = fetch_central_bank_action(pool, bank, meeting_date).await?;
+            let satisfied = actual == *expected_action;
+            info!(
+                "央行判定: {} 预期 {} 实际 {} -> {}",
+                bank, expected_action, actual, satisfied
+            );
+            Ok(satisfied)
+        }
 
-        // TODO: 调用 Yahoo Finance API
-        let base_date = NaiveDate::parse_from_str(base_date_str, "%Y-%m-%d")
-            .map_err(|e| format!("Invalid base_date: {}", e))?;
-        let obs_date = NaiveDate::parse_from_str(observation_date_str, "%Y-%m-%d")
-            .map_err(|e| format!("Invalid observation_date: {}", e))?;
+        Rule::UrlKeyword { url, keywords, match_all } => {
+            let content = fetch_url_content(url).await?;
+            let result = if *match_all {
+                keywords.iter().all(|kw| content.contains(kw.as_str()))
+            } else {
+                keywords.iter().any(|kw| content.contains(kw.as_str()))
+            };
+            info!("URL关键词判定: {} -> {}", url, result);
+            Ok(result)
+        }
 
-        let base_price = get_close_price(pool, symbol, base_date).await?
-            .ok_or_else(|| format!("No price data for {} on {}", symbol, base_date))?;
-        let obs_price = get_close_price(pool, symbol, obs_date).await?
-            .ok_or_else(|| format!("No price data for {} on {}", symbol, obs_date))?;
+        Rule::EconomicData { indicator, expected_value, operator, actual_value_source, actual_value, .. } => {
+            let actual = match actual_value_source.as_str() {
+                "manual" => actual_value.ok_or("Missing manual value")?,
+                "api" => fetch_economic_data(pool, indicator).await?,
+                _ => return Err("Invalid actual_value_source".into()),
+            };
+            let satisfied = match operator.as_str() {
+                "greater" => actual > *expected_value,
+                "less" => actual < *expected_value,
+                "equal" => (actual - expected_value).abs() < 1e-6,
+                _ => false,
+            };
+            info!("经济数据判定: {} 预期 {} 实际 {} -> {}", indicator, expected_value, actual, satisfied);
+            Ok(satisfied)
+        }
 
-        let change = (obs_price - base_price) / base_price * 100.0;
-        let satisfied = match direction {
-            "greater" => change >= threshold,
-            "less" => change <= -threshold,
-            _ => false,
-        };
-        tracing::info!(
-            "价格判定: {} 从 {} 到 {} 涨跌 {:.2}%, 阈值 {} {}, 满足: {}",
-            symbol, base_price, obs_price, change, direction, threshold, satisfied
-        );
-        Ok(satisfied)
+        Rule::Earnings { symbol, expected_eps, actual_eps_source, actual_eps, .. } => {
+            let actual = match actual_eps_source.as_str() {
+                "manual" => actual_eps.ok_or("Missing manual EPS")?,
+                "api" => fetch_earnings(pool, symbol).await?,
+                _ => return Err("Invalid actual_eps_source".into()),
+            };
+            let satisfied = actual > *expected_eps;
+            info!("财报判定: {} 预期 EPS {} 实际 {} -> {}", symbol, expected_eps, actual, satisfied);
+            Ok(satisfied)
+        }
+
+        Rule::Commodity { symbol, base_date, observation_date, threshold_percent, direction, .. } => {
+            let change = fetch_commodity_change(pool, symbol, base_date, observation_date).await?;
+            let satisfied = match direction.as_str() {
+                "greater" => change >= *threshold_percent,
+                "less" => change <= *threshold_percent,
+                _ => false,
+            };
+            info!("商品判定: {} 涨跌幅 {:.2}% (阈值 {} {}) -> {}", symbol, change, direction, threshold_percent, satisfied);
+            Ok(satisfied)
+        }
     }
 }
 
-/// 央行利率决议判定器
-pub struct CentralBankVerifier;
+// ========== 辅助数据获取函数（带缓存） ==========
 
-#[async_trait]
-impl RuleVerifier for CentralBankVerifier {
-    async fn verify(&self, rule: &Value, pool: &PgPool) -> RuleResult<bool> {
-        let bank = rule["bank"].as_str().unwrap_or("");
-        let expected_action = rule["expected_action"].as_str().unwrap_or("");
-        // let meeting_date = rule["meeting_date"].as_str().unwrap_or("");
-
-                // 1. 映射规则中的 bank 字段到 FRED 的 series_id
-        let series_id = match bank {
-            "fomc" => "FEDFUNDS",      // 美联储联邦基金利率
-            "ecb" => "ECBASSETSW",     // 欧洲央行主要再融资操作利率
-            "pboc" => "CHNMLR",        // 中国人民银行贷款基础利率 (LPR)
-            // 其他映射...
-            _ => return Ok(false),      // 未知央行，直接返回不满足
-        };
-
-        // 2. FRED API 请求
-        // 3. 解析最新利率值
-        let current_rate = get_fred_series_value(pool, series_id).await?
-            .ok_or_else(|| format!("No rate data for {} on fred",series_id))?;
-
-        // 4. 判定是否满足预期
-        let expected_rate: f64 = expected_action.parse().unwrap_or(0.0);
-        let satisfied = (current_rate - expected_rate).abs() < f64::EPSILON;
-
-        tracing::info!(
-            "央行利率判定: 预期 {}% 实际 {}% -> {}",
-            expected_rate, current_rate, satisfied
-        );
-        Ok(satisfied)
-    }
+async fn fetch_price_change(
+    pool: &PgPool,
+    symbol: &str,
+    base_date: &NaiveDate,
+    obs_date: &NaiveDate,
+) -> Result<f64, Box<dyn Error + Send + Sync>> {
+    let base_price = get_close_price(pool, symbol, base_date).await?
+        .ok_or_else(|| format!("No price data for {} on {}", symbol, base_date))?;
+    let obs_price = get_close_price(pool, symbol, obs_date).await?
+        .ok_or_else(|| format!("No price data for {} on {}", symbol, obs_date))?;
+    Ok((obs_price - base_price) / base_price * 100.0)
 }
 
-/// 经济数据对比判定器
-pub struct EconomicDataVerifier;
-
-#[async_trait]
-impl RuleVerifier for EconomicDataVerifier {
-    async fn verify(&self, rule: &Value, pool: &PgPool) -> RuleResult<bool> {
-
-        let indicator = rule["indicator"].as_str().unwrap_or("");
-        let operator = rule["operator"].as_str().unwrap_or("greater");
-        let expected = rule["expected_value"].as_f64().unwrap_or(0.0);
-
-        // 1. 映射指标名称到 FRED series_id
-        let series_id = match indicator {
-            "cpi" => "CPIAUCSL",        // 美国CPI
-            "gdp" => "GDP",              // 美国GDP
-            "unemployment" => "UNRATE",  // 美国失业率
-            // 其他映射...
-            _ => return Ok(false),
-        };
-
-        // 2. 请求 FRED API 获取最新值
-        let actual = get_fred_series_value(pool, series_id).await?
-            .ok_or_else(|| format!("No rate data for {} on fred",series_id))?;
-
-        // 3. 判定
-        let satisfied = match operator {
-            "greater" => actual > expected,
-            "less" => actual < expected,
-            "equal" => (actual - expected).abs() < 1e-6,
-            _ => false,
-        };
-
-        tracing::info!("经济数据判定: {} (预期 {} {} 实际 {}) -> {}", indicator, expected, operator, actual, satisfied);
-        Ok(satisfied)
-
-    }
+async fn fetch_commodity_change(
+    pool: &PgPool,
+    symbol: &str,
+    base_date: &NaiveDate,
+    obs_date: &NaiveDate,
+) -> Result<f64, Box<dyn Error + Send + Sync>> {
+    fetch_price_change(pool, symbol, base_date, obs_date).await
 }
 
-/// URL关键词检测
-pub struct UrlKeywordVerifier;
+async fn fetch_central_bank_action(
+    pool: &PgPool,
+    bank: &str,
+    meeting_date: &NaiveDate,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let series_id = match bank {
+        "fomc" => "FEDFUNDS",
+        "ecb" => "ECBASSETSW",
+        "boj" => "JPNIRLTR",
+        "pboc" => "CHNMLR",
+        _ => return Err(format!("Unsupported bank: {}", bank).into()),
+    };
 
-#[async_trait]
-impl RuleVerifier for UrlKeywordVerifier {
-    async fn verify(&self, rule: &Value, _pool: &PgPool) -> RuleResult<bool> {
-        let _url = rule["url"].as_str().unwrap_or("");
-        let empty_vec = vec![];
-        let keywords = rule["keywords"].as_array().unwrap_or(&empty_vec);
-        let match_all = rule["match_all"].as_bool().unwrap_or(false);
-        // 模拟获取网页内容
-        let content = "<html>example</html>";
-        let contains = keywords.iter().all(|k| content.contains(k.as_str().unwrap_or("")));
-        let result = if match_all { contains } else { keywords.iter().any(|k| content.contains(k.as_str().unwrap_or(""))) };
-        Ok(result)
-    }
+    let rate_meeting = get_fred_rate_on_date(pool, series_id, meeting_date).await?;
+    let prev_date = *meeting_date - Duration::days(1);
+    let rate_prev = get_fred_rate_on_date(pool, series_id, &prev_date).await?;
+
+    let diff_bps = (rate_meeting - rate_prev) * 100.0;
+    let action = if diff_bps.abs() < 0.5 {
+        "hold".to_string()
+    } else if diff_bps > 0.0 {
+        format!("hike_{:.0}bp", diff_bps)
+    } else {
+        format!("cut_{:.0}bp", -diff_bps)
+    };
+    Ok(action)
 }
 
+async fn get_fred_rate_on_date(
+    pool: &PgPool,
+    series_id: &str,
+    date: &NaiveDate,
+) -> Result<f64, Box<dyn Error + Send + Sync>> {
+    let cache_key = format!("fred:{}:{}", series_id, date);
+    if let Some(cached) = get_cached_response(pool, &cache_key).await? {
+        if let Some(value) = cached["value"].as_f64() {
+            return Ok(value);
+        }
+    }
 
+    let api_key = env::var("FRED_API_KEY").map_err(|_| "FRED_API_KEY not set")?;
+    let date_str = date.format("%Y-%m-%d").to_string();
+    let url = format!(
+        "https://api.stlouisfed.org/fred/series/observations?series_id={}&api_key={}&file_type=json&observation_date={}",
+        series_id, api_key, date_str
+    );
 
-/// 获取指定股票在某个日期的收盘价（美股）
-/// async function getHistoricalData(symbol, period1, period2) {
-//   const history = await yahooFinance.historical(symbol, {
-//     period1, // Start date
-//     period2, // End date
-//     interval: '1d' // '1d', '1wk', '1mo'
-//   });
-/// 
-async fn get_close_price(pool: &PgPool, symbol: &str, date: NaiveDate) -> Result<Option<f64>, Box<dyn std::error::Error + Send + Sync>> {
-    
-    //1. 构造缓存键
+    let client = Client::new();
+    let resp = client.get(&url).send().await?;
+    let json: Value = resp.json().await?;
+
+    let value = json["observations"][0]["value"]
+        .as_str()
+        .and_then(|s| s.parse::<f64>().ok())
+        .ok_or_else(|| format!("No data for {} on {}", series_id, date))?;
+
+    let cache_value = serde_json::json!({ "value": value });
+    set_cached_response(pool, &cache_key, &cache_value, 3600).await?;
+    Ok(value)
+}
+
+async fn fetch_economic_data(pool: &PgPool, indicator: &str) -> Result<f64, Box<dyn Error + Send + Sync>> {
+    let series_id = match indicator {
+        "cpi" => "CPIAUCSL",
+        "gdp" => "GDP",
+        "nonfarm" => "PAYEMS",
+        _ => return Err(format!("Unsupported indicator: {}", indicator).into()),
+    };
+    get_fred_series_value(pool, series_id).await?
+        .ok_or_else(|| format!("No data for FRED series {}", series_id).into())
+}
+
+async fn fetch_url_content(url: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let client = Client::new();
+    let resp = client.get(url).send().await?;
+    let text = resp.text().await?;
+    Ok(text)
+}
+
+// ========== 底层数据接口 ==========
+
+async fn get_close_price(
+    pool: &PgPool,
+    symbol: &str,
+    date: &NaiveDate,
+) -> Result<Option<f64>, Box<dyn Error + Send + Sync>> {
     let cache_key = format!("yahoo:{}:{}", symbol, date);
-    // 2. 尝试从缓存读取
     if let Some(cached) = get_cached_response(pool, &cache_key).await? {
         if let Some(price) = cached.as_f64() {
             return Ok(Some(price));
         }
     }
-    // 3. 缓存未命中，调用真实 API  
-    // 设置 User-Agent 避免被拒
+
     let client = Client::builder()
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
         .build()?;
 
-    // 时间戳：当天 00:00:00 UTC 到下一天 00:00:00 UTC
     let start = date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
     let end = date.succ_opt().unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
 
@@ -183,21 +282,23 @@ async fn get_close_price(pool: &PgPool, symbol: &str, date: NaiveDate) -> Result
     let resp = client.get(&url).send().await?;
     let json: Value = resp.json().await?;
 
-    // 解析收盘价（可能为 null）
-    let close_prices = json["chart"]["result"][0]["indicators"]["quote"][0]["close"].as_array();
-    if let Some(prices) = close_prices {
-        if let Some(price) = prices.get(0).and_then(|p| p.as_f64()) {
-            return Ok(Some(price));
-        }
+    let price = json["chart"]["result"][0]["indicators"]["quote"][0]["close"]
+        .as_array()
+        .and_then(|arr| arr.get(0).and_then(|v| v.as_f64()));
+
+    if let Some(p) = price {
+        let cache_value = serde_json::json!(p);
+        set_cached_response(pool, &cache_key, &cache_value, 3600).await?;
+        Ok(Some(p))
+    } else {
+        Ok(None)
     }
-    Ok(None)
 }
 
-
 async fn get_fred_series_value(
-    pool:&PgPool,
-    series_id:  &str,
-) -> Result<Option<f64>, Box<dyn Error+Send+Sync>>{
+    pool: &PgPool,
+    series_id: &str,
+) -> Result<Option<f64>, Box<dyn Error + Send + Sync>> {
     let cache_key = format!("fred:{}", series_id);
     if let Some(cached) = get_cached_response(pool, &cache_key).await? {
         if let Some(value) = cached["value"].as_f64() {
@@ -205,20 +306,228 @@ async fn get_fred_series_value(
         }
     }
 
-    // 2. 请求 FRED API 获取最新值
-    let api_key = env::var("FRED_API_KEY").expect("FRED_API_KEY must be set");
+    let api_key = env::var("FRED_API_KEY")
+        .map_err(|_| "FRED_API_KEY not set")?;
     let url = format!(
         "https://api.stlouisfed.org/fred/series/observations?series_id={}&api_key={}&file_type=json&sort_order=desc&limit=1",
         series_id, api_key
     );
+
     let client = Client::new();
-    let response = client.get(&url).send().await?;
+    let resp = client.get(&url).send().await?;
+    let json: Value = resp.json().await?;
+
+    let value = json["observations"][0]["value"]
+        .as_str()
+        .and_then(|s| s.parse::<f64>().ok());
+
+    if let Some(v) = value {
+        let cache_value = serde_json::json!({ "value": v });
+        set_cached_response(pool, &cache_key, &cache_value, 3600).await?;
+        Ok(Some(v))
+    } else {
+        Ok(None)
+    }
+}
+
+#[allow(dead_code)]
+fn bank_to_series_id(bank: &str) -> &str {
+    match bank {
+        "fomc" => "FEDFUNDS",
+        "ecb" => "ECBASSETSW",
+        "boj" => "JPNIRLTR",
+        "pboc" => "CHNMLR",
+        _ => "",
+    }
+}
+
+// 全局缓存：使用 LazyLock 替代 lazy_static!
+static CRUMB_CACHE: LazyLock<Arc<Mutex<Option<String>>>> = LazyLock::new(|| Arc::new(Mutex::new(None)));
+static A3_COOKIE_CACHE: LazyLock<Arc<Mutex<Option<String>>>> = LazyLock::new(|| Arc::new(Mutex::new(None)));
+
+// ========== 财报获取（修复 reqwest 方法） ==========
+async fn fetch_earnings(
+    pool: &PgPool,
+    symbol: &str,
+) -> Result<f64, Box<dyn Error + Send + Sync>> {
+    let today = chrono::Utc::now().date_naive();
+    let last_trading_day = get_last_trading_day(today);
+    let start_date = last_trading_day;
+    let end_date = start_date + Duration::days(1);
+
+    let cache_key = format!("earnings:{}:{}", symbol, start_date);
+    if let Some(cached) = get_cached_response(pool, &cache_key).await? {
+        if let Some(eps) = cached["epsactual"].as_f64() {
+            return Ok(eps);
+        }
+    }
+
+    let crumb = get_crumb().await?;
+    let a3_cookie = get_a3_cookie().await?;
+
+    let client = Client::builder().build()?;
+
+    // ---- 修改点1：手工拼接查询参数 ----
+    let mut url = Url::parse("https://query2.finance.yahoo.com/v1/finance/visualization")?;
+    url.query_pairs_mut()
+        .clear()
+        .extend_pairs([
+            ("crumb", crumb.as_str()),
+            ("lang", "en-US"),
+            ("region", "US"),
+            ("corsDomain", "finance.yahoo.com"),
+        ]);
+
+    let start_date_str = start_date.format("%Y-%m-%d").to_string();
+    let end_date_str = end_date.format("%Y-%m-%d").to_string();
+
+    let payload = serde_json::json!({
+        "entityIdType": "earnings",
+        "includeFields": [
+            "ticker",
+            "companyshortname",
+            "eventname",
+            "startdatetime",
+            "startdatetimetype",
+            "epsestimate",
+            "epsactual",
+            "epssurprisepct",
+            "timeZoneShortName",
+            "gmtOffsetMilliSeconds",
+        ],
+        "offset": 0,
+        "query": {
+            "operands": [
+                { "operands": ["startdatetime", start_date_str], "operator": "gte" },
+                { "operands": ["startdatetime", end_date_str], "operator": "lt" },
+                { "operands": ["region", "us"], "operator": "eq" },
+            ],
+            "operator": "and",
+        },
+        "size": 100,
+        "sortField": "companyshortname",
+        "sortType": "ASC",
+    });
+
+    let response = client
+        .post(url)                         // 直接使用构建好的 Url
+        .header("Accept", "application/json, text/javascript, */*; q=0.01")
+        .header("Content-Type", "application/json")
+        .header("X-Requested-With", "XMLHttpRequest")
+        .header("Referer", "https://finance.yahoo.com/calendar/earnings")
+        .header("Cookie", format!("A3={}", a3_cookie))
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        .json(&payload)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        return Err(format!("Yahoo API 请求失败: {}", response.status()).into());
+    }
+
     let json: Value = response.json().await?;
+    let eps_actual = json["finance"]["result"][0]["documents"][0]["rows"]
+        .as_array()
+        .ok_or("Missing rows in response")?
+        .iter()
+        .find_map(|row| {
+            let ticker = row[0].as_str().unwrap_or("");
+            if ticker == symbol {
+                row.get(5).and_then(|v| v.as_f64())
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| format!("No EPS data found for symbol {}", symbol))?;
 
-    let value = json["observations"][0]["value"].as_str()
-        .and_then(|s| s.parse().ok());
+    let cache_value = serde_json::json!({ "epsactual": eps_actual });
+    set_cached_response(pool, &cache_key, &cache_value, 3600).await?;
+    Ok(eps_actual)
+}
 
-    let cache_value = serde_json::json!({ "value": value });
-    let _ = set_cached_response(pool, &cache_key, &cache_value, 3600).await;
-    Ok(value)
+// ========== 工具函数 ==========
+fn get_last_trading_day(date: NaiveDate) -> NaiveDate {
+    let mut d = date;
+    while d.weekday() == chrono::Weekday::Sat || d.weekday() == chrono::Weekday::Sun {
+        d = d - Duration::days(1);
+    }
+    d
+}
+
+async fn get_crumb() -> Result<String, Box<dyn Error + Send + Sync>> {
+    {
+        let lock = CRUMB_CACHE.lock().await;
+        if let Some(crumb) = lock.as_ref() {
+            return Ok(crumb.clone());
+        }
+    }
+
+    let client = Client::new();
+    let resp = client
+        .get("https://finance.yahoo.com")
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        .send()
+        .await?;
+    let body = resp.text().await?;
+
+    let re = Regex::new(r#""crumb":"([^"]+)""#)?;
+    let crumb = re
+        .captures(&body)
+        .and_then(|cap| cap.get(1).map(|m| m.as_str().to_string()))
+        .ok_or("Failed to extract crumb from Yahoo Finance homepage")?;
+
+    {
+        let mut lock = CRUMB_CACHE.lock().await;
+        *lock = Some(crumb.clone());
+    }
+    Ok(crumb)
+}
+
+async fn get_a3_cookie() -> Result<String, Box<dyn Error + Send + Sync>> {
+    {
+        let lock = A3_COOKIE_CACHE.lock().await;
+        if let Some(cookie) = lock.as_ref() {
+            return Ok(cookie.clone());
+        }
+    }
+
+    if let Ok(cookie) = std::env::var("YAHOO_A3_COOKIE") {
+        {
+            let mut lock = A3_COOKIE_CACHE.lock().await;
+            *lock = Some(cookie.clone());
+        }
+        return Ok(cookie);
+    }
+
+    let client = Client::new();
+    let resp = client
+        .get("https://finance.yahoo.com")
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        .send()
+        .await?;
+
+    // ---- 修改点2：手动解析 Set-Cookie 头 ----
+    let headers = resp.headers();
+    let set_cookie_headers = headers.get_all("set-cookie");
+    for header in set_cookie_headers {
+        if let Ok(cookie_str) = header.to_str() {
+            // 解析 cookie 字符串，形如 "A3=value; path=/; domain=..."
+            for part in cookie_str.split(';') {
+                let part = part.trim();
+                if let Some((key, value)) = part.split_once('=') {
+                    if key.trim() == "A3" {
+                        let a3 = value.trim().to_string();
+                        // 缓存起来
+                        {
+                            let mut lock = A3_COOKIE_CACHE.lock().await;
+                            *lock = Some(a3.clone());
+                        }
+                        return Ok(a3);
+                    }
+                }
+            }
+        }
+    }
+
+    Err("A3 cookie not found in response".into())
 }

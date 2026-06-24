@@ -32,7 +32,7 @@ async fn cleanup_old_news(pool: &PgPool) -> Result<(), sqlx::Error> {
         SET content = NULL
         WHERE published_at < (NOW() AT TIME ZONE 'UTC' - INTERVAL '7 days')
           AND NOT EXISTS (
-              SELECT 1 FROM predictions WHERE predictions.news_id = news.id
+              SELECT 1 FROM prediction_tasks WHERE prediction_tasks.news_id = news.id
           )
         "#
     )

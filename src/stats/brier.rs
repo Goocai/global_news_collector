@@ -54,9 +54,11 @@ pub async fn compute_brier_scores(
     // 人类预测
     let human = sqlx::query!(
         r#"
-        SELECT probability, outcome
-        FROM predictions
-        WHERE user_id = $1 AND prediction_type = 'human' AND outcome IS NOT NULL
+        SELECT hp.probability, p.outcome_human as outcome
+        FROM prediction_tasks p, human_predictions hp
+        WHERE p.user_id = $1 
+        AND p.outcome_human IS NOT NULL
+        AND p.id = hp.task_id
         "#,
         user_id
     )
@@ -83,10 +85,11 @@ pub async fn compute_brier_scores(
     // LLM 预测
     let llm = sqlx::query!(
         r#"
-        SELECT p.probability, p.outcome
-        FROM predictions p
-        JOIN predictions parent ON p.parent_prediction_id = parent.id
-        WHERE parent.user_id = $1 AND p.outcome IS NOT NULL
+        SELECT lp.probability, p.outcome_llm as outcome
+        FROM prediction_tasks p, llm_predictions lp
+        WHERE p.user_id = $1 
+        AND p.outcome_llm IS NOT NULL
+        AND p.id = lp.task_id
         "#,
         user_id
     )
@@ -113,7 +116,7 @@ pub async fn compute_brier_scores(
 
 pub async fn daily_brier_snapshot(pool: &PgPool) -> Result<(), sqlx::Error> {
     let users = sqlx::query!(
-        "SELECT DISTINCT user_id FROM predictions WHERE user_id IS NOT NULL"
+        "SELECT DISTINCT user_id FROM prediction_tasks WHERE user_id IS NOT NULL"
     )
     .fetch_all(pool)
     .await?;

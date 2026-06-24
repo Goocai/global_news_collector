@@ -11,40 +11,52 @@
 </head>
 <body class="bg-gray-100">
     <div x-data="statsApp()" x-init="init()" class="container mx-auto p-4">
-        
         <!-- 导航栏 -->
         <nav class="bg-white shadow mb-6 p-4 rounded-lg flex justify-between items-center">
-            <h1 class="text-3xl font-bold mb-6 text-center">📊 统计面板 & 认知纠偏</h1>
+            <h1 class="text-3xl font-bold">📊 统计面板 & 认知纠偏</h1>
             <div class="space-x-4">
                 <a href="/admin.html" class="text-blue-600 hover:underline">🔧 管理</a>
                 <button @click="logout" class="bg-red-500 hover:bg-red-600 text-white px-3 py-1 rounded text-sm">退出</button>
             </div>
         </nav>
 
-        <!-- 新闻列表 -->
-        <!-- 不对称比卡片 -->
-        <div class="bg-white rounded-lg shadow p-4 mb-6">
-            <h2 class="text-xl font-semibold">不对称比 (Asymmetry Ratio)</h2>
-            <div class="text-4xl font-bold mt-2" x-text="asymmetryRatio"></div>
-            <p class="text-sm text-gray-500">目标 > 1.5，越高代表仓位管理越反脆弱</p>
-            <div x-show="asymmetryRatio < 1.5" class="mt-2 bg-yellow-100 text-yellow-800 p-2 rounded">
-                ⚠️ 仓位管理过于平均，处于脆弱状态
+        <!-- 不对称比卡片（人类 vs LLM） -->
+        <div class="grid grid-cols-2 gap-4 mb-6">
+            <div class="bg-white rounded-lg shadow p-4">
+                <h2 class="text-xl font-semibold">🧑 人类不对称比</h2>
+                <div class="text-4xl font-bold mt-2" x-text="humanAsymmetry"></div>
+                <p class="text-sm text-gray-500">目标 > 1.5，越高越反脆弱</p>
+                <div x-show="humanAsymmetry < 1.5" class="mt-2 bg-yellow-100 text-yellow-800 p-2 rounded">
+                    ⚠️ 仓位管理过于平均，处于脆弱状态
+                </div>
+            </div>
+            <div class="bg-white rounded-lg shadow p-4">
+                <h2 class="text-xl font-semibold">🤖 LLM 不对称比</h2>
+                <div class="text-4xl font-bold mt-2" x-text="llmAsymmetry"></div>
+                <p class="text-sm text-gray-500">目标 > 1.5，越高越反脆弱</p>
+                <div x-show="llmAsymmetry < 1.5" class="mt-2 bg-yellow-100 text-yellow-800 p-2 rounded">
+                    ⚠️ 仓位管理过于平均，处于脆弱状态
+                </div>
             </div>
         </div>
 
-        <!-- Brier 曲线 -->
+        <!-- Brier 曲线（不变） -->
         <div class="bg-white rounded-lg shadow p-4 mb-6">
             <h2 class="text-xl font-semibold mb-2">Brier Score 对抗曲线</h2>
             <canvas id="brierChart" width="400" height="200"></canvas>
         </div>
 
-        <!-- 反脆弱气泡图 (使用 Chart.js 散点图) -->
+        <!-- 反脆弱气泡图（人类 + LLM 合并展示） -->
         <div class="bg-white rounded-lg shadow p-4 mb-6">
             <h2 class="text-xl font-semibold mb-2">反脆弱气泡图 (概率 vs 结果，气泡大小=仓位)</h2>
+            <div class="flex gap-4 text-sm mb-2">
+                <span><span class="inline-block w-3 h-3 bg-blue-500 rounded-full"></span> 人类</span>
+                <span><span class="inline-block w-3 h-3 bg-red-500 rounded-full"></span> LLM</span>
+            </div>
             <canvas id="bubbleChart" width="400" height="200"></canvas>
         </div>
 
-        <!-- 强制复盘黑名单 -->
+        <!-- 强制复盘黑名单（不变） -->
         <div class="bg-white rounded-lg shadow p-4 mb-6">
             <h2 class="text-xl font-semibold mb-2 text-red-700">⚠️ 待复盘黑名单</h2>
             <div x-show="pendingReviews.length === 0" class="text-gray-500">暂无待复盘项</div>
@@ -61,9 +73,11 @@
     <script>
         function statsApp() {
             return {
-                asymmetryRatio: 0,
+                humanAsymmetry: 0,
+                llmAsymmetry: 0,
                 brierHistory: [],
-                bubbleData: [],
+                humanBubbleData: [],
+                llmBubbleData: [],
                 pendingReviews: [],
                 brierChart: null,
                 bubbleChart: null,
@@ -76,27 +90,35 @@
                 },
                 async loadAntiFragile() {
                     const headers = { ...Auth.getHeaders() };
-                    const res = await fetch('/api/stats/anti-fragile',{headers});
+                    const res = await fetch('/api/stats/anti-fragile', { headers });
                     if (res.ok) {
                         const data = await res.json();
-                        this.asymmetryRatio = parseFloat(data.asymmetry_ratio).toFixed(2);
-                        this.bubbleData = data.bubble_data.map(p => ({
+                        // 人类
+                        this.humanAsymmetry = parseFloat(data.human.asymmetry_ratio).toFixed(2);
+                        this.humanBubbleData = data.human.bubble_data.map(p => ({
                             x: parseFloat(p.probability),
                             y: p.outcome,
-                            r: parseFloat(p.position_size_pct) / 2  // 半径缩放
+                            r: parseFloat(p.position_size_pct) / 2
+                        }));
+                        // LLM
+                        this.llmAsymmetry = parseFloat(data.llm.asymmetry_ratio).toFixed(2);
+                        this.llmBubbleData = data.llm.bubble_data.map(p => ({
+                            x: parseFloat(p.probability),
+                            y: p.outcome,
+                            r: parseFloat(p.position_size_pct) / 2
                         }));
                     }
                 },
                 async loadBrierHistory() {
                     const headers = { ...Auth.getHeaders() };
-                    const res = await fetch('/api/stats/brier',{headers});
+                    const res = await fetch('/api/stats/brier', { headers });
                     if (res.ok) {
                         this.brierHistory = await res.json();
                     }
                 },
                 async loadPendingReviews() {
                     const headers = { ...Auth.getHeaders() };
-                    const res = await fetch('/api/reviews/pending-reviews',{headers});
+                    const res = await fetch('/api/reviews/pending-reviews', { headers });
                     if (res.ok) {
                         this.pendingReviews = await res.json();
                         this.pendingReviews.forEach(r => r.postMortem = '');
@@ -110,13 +132,13 @@
                         body: JSON.stringify({ post_mortem: text })
                     });
                     if (res.ok) {
-                        // 从列表中移除
                         this.pendingReviews = this.pendingReviews.filter(r => r.id !== id);
                     } else {
                         alert('提交失败');
                     }
                 },
                 renderCharts() {
+                    // Brier曲线
                     if (this.brierHistory.length > 0) {
                         const labels = this.brierHistory.map(h => new Date(h.calculation_time).toLocaleDateString());
                         const humanData = this.brierHistory.map(h => parseFloat(h.human_brier));
@@ -124,19 +146,43 @@
                         const ctx = document.getElementById('brierChart').getContext('2d');
                         this.brierChart = new Chart(ctx, {
                             type: 'line',
-                            data: { labels, datasets: [
-                                { label: '人类 Brier', data: humanData, borderColor: 'blue' },
-                                { label: 'LLM Brier', data: llmData, borderColor: 'red' }
-                            ]}
+                            data: {
+                                labels,
+                                datasets: [
+                                    { label: '人类 Brier', data: humanData, borderColor: 'blue' },
+                                    { label: 'LLM Brier', data: llmData, borderColor: 'red' }
+                                ]
+                            }
                         });
                     }
-                    if (this.bubbleData.length > 0) {
+
+                    // 气泡图（合并人类与LLM）
+                    if (this.humanBubbleData.length > 0 || this.llmBubbleData.length > 0) {
                         const ctxBubble = document.getElementById('bubbleChart').getContext('2d');
+                        const datasets = [];
+                        if (this.humanBubbleData.length > 0) {
+                            datasets.push({
+                                label: '人类',
+                                data: this.humanBubbleData,
+                                backgroundColor: 'rgba(54, 162, 235, 0.6)'
+                            });
+                        }
+                        if (this.llmBubbleData.length > 0) {
+                            datasets.push({
+                                label: 'LLM',
+                                data: this.llmBubbleData,
+                                backgroundColor: 'rgba(255, 99, 132, 0.6)'
+                            });
+                        }
                         this.bubbleChart = new Chart(ctxBubble, {
                             type: 'bubble',
-                            data: { datasets: [{ label: '预测', data: this.bubbleData, backgroundColor: 'rgba(0, 123, 255, 0.6)' }] },
-                            options: { scales: { x: { title: { display: true, text: '概率 (%)' }, min: 0, max: 100 },
-                                                y: { title: { display: true, text: '结果 (0=证伪,1=证实)' }, ticks: { stepSize: 1 } } } }
+                            data: { datasets },
+                            options: {
+                                scales: {
+                                    x: { title: { display: true, text: '概率 (%)' }, min: 0, max: 100 },
+                                    y: { title: { display: true, text: '结果 (0=证伪,1=证实)' }, ticks: { stepSize: 1 } }
+                                }
+                            }
                         });
                     }
                 },

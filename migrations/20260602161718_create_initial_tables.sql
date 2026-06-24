@@ -1,12 +1,11 @@
--- 迁移文件：initial_schema
--- 强制使用 UTC 时区（PostgreSQL 默认，显式声明无妨）
+-- 强制使用 UTC 时区
 SET TIME ZONE 'UTC';
 
 -- 用户表
 CREATE TABLE users (
     id SERIAL PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
-    role TEXT NOT NULL CHECK (role IN ('human_expert', 'admin')),
+    role TEXT NOT NULL CHECK (role IN ('human', 'admin')),
     password_hash TEXT NOT NULL,
     created_at TIMESTAMPTZ DEFAULT (now() AT TIME ZONE 'UTC')
 );
@@ -28,37 +27,51 @@ CREATE TABLE news (
     id SERIAL PRIMARY KEY,
     source_id INT REFERENCES sources(id) ON DELETE CASCADE,
     title TEXT NOT NULL,
-    description TEXT,          -- 新增：RSS 摘要/描述
+    description TEXT,
     content TEXT,
-    content_fetching BOOLEAN DEFAULT false,
     url TEXT UNIQUE NOT NULL,
     published_at TIMESTAMPTZ NOT NULL,
     fetched_at TIMESTAMPTZ DEFAULT (now() AT TIME ZONE 'UTC')
-
 );
 
--- 预测表（核心）
-CREATE TABLE predictions (
+-- 预测任务主表
+CREATE TABLE prediction_tasks (
     id SERIAL PRIMARY KEY,
     news_id INT REFERENCES news(id) ON DELETE CASCADE,
     user_id INT REFERENCES users(id) ON DELETE SET NULL,
-    prediction_type TEXT NOT NULL CHECK (prediction_type IN ('human', 'llm')),
-    extracted_facts TEXT,
-    inference TEXT NOT NULL,
-    probability DECIMAL(5,2) NOT NULL CHECK (probability BETWEEN 0.00 AND 100.00),
-    position_size_pct DECIMAL(5,2) NOT NULL CHECK (position_size_pct BETWEEN 0.00 AND 100.00),
-    rule_json JSONB,
-    outcome INT CHECK (outcome IN (0, 1)),
-    parent_prediction_id INT REFERENCES predictions(id) ON DELETE CASCADE,
+    extracted_facts TEXT NOT NULL,          
+    rule_json JSONB NOT NULL,                
+    outcome_human INT CHECK (outcome_human IN (0, 1)),
+    outcome_llm   INT CHECK (outcome_llm   IN (0, 1)),
     target_date DATE NOT NULL,
     judge_status TEXT DEFAULT 'pending' CHECK (judge_status IN ('pending', 'judging', 'resolved', 'failed_api')),
     post_mortem TEXT,
-    llm_skip BOOLEAN DEFAULT false,
+    llm_predicted BOOLEAN DEFAULT false,         -- true：已尝试生成 LLM 预测（或已跳过）
     submitted_at TIMESTAMPTZ DEFAULT (now() AT TIME ZONE 'UTC'),
     verified_at TIMESTAMPTZ
 );
 
--- 噪声标记表（用户反馈）
+-- 人类预测详情（含 inference_rule）
+CREATE TABLE human_predictions (
+    id SERIAL PRIMARY KEY,
+    task_id INT REFERENCES prediction_tasks(id) ON DELETE CASCADE,
+    inference TEXT NOT NULL,                     -- 推理逻辑说明
+    inference_rule JSONB NOT NULL,                        -- 人类自己的预期参数
+    probability DECIMAL(5,2) NOT NULL CHECK (probability BETWEEN 0 AND 100),
+    position_size_pct DECIMAL(5,2) NOT NULL CHECK (position_size_pct BETWEEN 0 AND 100)
+);
+
+-- LLM 预测详情（含 inference_rule）
+CREATE TABLE llm_predictions (
+    id SERIAL PRIMARY KEY,
+    task_id INT REFERENCES prediction_tasks(id) ON DELETE CASCADE,
+    inference TEXT NOT NULL,
+    inference_rule JSONB NOT NULL,                        -- LLM 自己的预期参数
+    probability DECIMAL(5,2) NOT NULL CHECK (probability BETWEEN 0 AND 100),
+    position_size_pct DECIMAL(5,2) NOT NULL CHECK (position_size_pct BETWEEN 0 AND 100)
+);
+
+-- 噪声标记表
 CREATE TABLE noise_flags (
     id SERIAL PRIMARY KEY,
     news_id INT NOT NULL REFERENCES news(id) ON DELETE CASCADE,
@@ -78,33 +91,42 @@ CREATE TABLE brier_history (
     delta DECIMAL(10,4) GENERATED ALWAYS AS (human_brier - llm_brier) STORED
 );
 
-
--- Add migration script here
--- 创建 API 缓存表
+-- API 缓存表
 CREATE TABLE api_cache (
     id SERIAL PRIMARY KEY,
-    cache_key TEXT NOT NULL UNIQUE,          -- 请求的唯一标识
-    response_data JSONB NOT NULL,            -- 存储完整的响应 JSON
+    cache_key TEXT NOT NULL UNIQUE,
+    response_data JSONB NOT NULL,
     created_at TIMESTAMPTZ DEFAULT NOW(),
-    expires_at TIMESTAMPTZ NOT NULL          -- 过期时间
+    expires_at TIMESTAMPTZ NOT NULL
 );
 
-
--- 索引（用于查询性能，后续再根据需要添加）
+-- ========== 索引 ==========
 CREATE INDEX idx_news_published_at ON news(published_at DESC);
 CREATE UNIQUE INDEX idx_news_url_unique ON news(url);
-CREATE INDEX idx_predictions_active_judge ON predictions(judge_status, target_date) WHERE outcome IS NULL;
-CREATE INDEX idx_predictions_llm_queue_scan ON predictions(prediction_type, id) WHERE llm_skip = false;
-CREATE INDEX idx_predictions_parent_link ON predictions(parent_prediction_id) WHERE parent_prediction_id IS NOT NULL;
-CREATE INDEX idx_predictions_news_type ON predictions(news_id, prediction_type);
+
+-- 判定扫描：未决且状态为 pending/failed_api 的任务
+CREATE INDEX idx_tasks_judge ON prediction_tasks(judge_status, target_date)
+    WHERE outcome_human IS NULL OR outcome_llm IS NULL;
+
+-- LLM 队列扫描：未进行 LLM 预测的任务
+CREATE INDEX idx_tasks_llm_queue ON prediction_tasks(id)
+    WHERE llm_predicted = false;
+
+-- 关联查询索引
+CREATE INDEX idx_tasks_news ON prediction_tasks(news_id);
+CREATE INDEX idx_human_task ON human_predictions(task_id);
+CREATE INDEX idx_llm_task ON llm_predictions(task_id);
 CREATE INDEX idx_noise_flags_lookup ON noise_flags(news_id, flagged_at);
+CREATE INDEX idx_api_cache_expires ON api_cache(expires_at);
 
--- 索引加速查询和清理
-CREATE INDEX idx_api_cache_key ON api_cache(cache_key);
-CREATE INDEX idx_api_cache_expires_at ON api_cache(expires_at);
+-- 加速按用户筛选 + 排序
+CREATE INDEX idx_tasks_user_submitted ON prediction_tasks(user_id, submitted_at DESC);
 
--- 示例：添加新华社国际频道
-INSERT INTO sources (name, url, feed_type, refresh_interval_sec, enabled) 
+-- 加速结果已确定且无事后分析的查询
+CREATE INDEX idx_tasks_resolved_no_postmortem ON prediction_tasks(user_id, submitted_at DESC)
+    WHERE outcome_human IS NOT NULL AND outcome_llm IS NOT NULL
+      AND (post_mortem IS NULL OR post_mortem = '');
+
+-- 示例数据
+INSERT INTO sources (name, url, feed_type, refresh_interval_sec, enabled)
 VALUES ('中新网财经新闻', 'https://www.chinanews.com.cn/rss/finance.xml', 'rss', 600, true);
-
-

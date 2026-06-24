@@ -5,11 +5,9 @@ use axum::{
     Router,
     routing::{get,post},
 };
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool};
 use chrono::{DateTime, Utc};
-use crate::collector::fetcher::fetch_full_content;
 use crate::auth::extractor::AuthUser;
 
 // 列表项的响应结构
@@ -29,12 +27,10 @@ pub struct NewsListItem{
 pub struct NewsDetail {
     pub id: i32,
     pub title: String,
-    pub content: Option<String>,
-    pub description: Option<String>,
+    pub summary: Option<String>,
     pub source_name: String,
     pub published_at: DateTime<Utc>,
     pub url: String,
-    pub fetching: bool,  // 是否正在抓取
 }
 
 // 分页参数
@@ -103,11 +99,9 @@ async fn get_news(
             n.id, 
             n.title, 
             n.description,
-            n.content, 
             n.url,
             s.name as source_name, 
-            n.published_at,
-            n.content_fetching
+            n.published_at
         FROM news n
         JOIN sources s ON n.source_id = s.id
         WHERE n.id = $1
@@ -124,58 +118,14 @@ async fn get_news(
         }
     })?;
 
-    // 2. 如果需要抓取正文（content 为空，且不在抓取中）
-    if row.content.is_none() && !row.content_fetching.unwrap_or(false) {
-        // 原子更新：将 content_fetching 设为 true，防止并发重复抓取
-        let updated = sqlx::query!(
-            "UPDATE news SET content_fetching = true WHERE id = $1 AND content IS NULL AND content_fetching = false",
-            id
-        )
-        .execute(&pool)
-        .await
-        .map(|res| res.rows_affected() == 1)
-        .unwrap_or(false);
-
-        if updated {
-            let pool_clone = pool.clone();
-            let url_clone = row.url.clone();
-            // 后台异步抓取，不阻塞响应
-            tokio::spawn(async move {
-                let client = Client::new();
-                if let Some(content) = fetch_full_content(&client, &url_clone).await {
-                    let _ = sqlx::query!(
-                        "UPDATE news SET content = $1, content_fetching = false WHERE id = $2",
-                        content,
-                        id
-                    )
-                    .execute(&pool_clone)
-                    .await;
-                } else {
-                    // 抓取失败，重置标志
-                    let _ = sqlx::query!(
-                        "UPDATE news SET content_fetching = false WHERE id = $1",
-                        id
-                    )
-                    .execute(&pool_clone)
-                    .await;
-                }
-            });
-        }
-    }
-
-
-
-    let fetching = row.content_fetching.unwrap_or(false);
 
     Ok(Json(NewsDetail {
         id: row.id,
         title: row.title,
-        description: row.description,
-        content: row.content,
+        summary: row.description,
         source_name: row.source_name,
         published_at: row.published_at,
         url: row.url,
-        fetching,   // 传递抓取状态
     }))
     
 }

@@ -1,14 +1,18 @@
+use chrono::{DateTime, NaiveDate};
+use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, Transaction};
 use tokio::time::{interval, Duration};
 use tracing::{info, warn, error};
+use serde::{Deserialize};
+use bigdecimal::{BigDecimal, FromPrimitive};
 // 暂未使用真实API，去除未使用的导入
 // use reqwest::Client;
 // use serde_json::json;
 
-/// 启动 LLM 后台 Worker（每 5 秒扫描一次）
+/// 启动 LLM 后台 Worker（每 x 秒扫描一次）
 pub async fn start_llm_worker(pool: PgPool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("启动 LLM 异步工作流 Worker");
-    let mut interval = interval(Duration::from_secs(5));
+    let mut interval = interval(Duration::from_secs(60));
     loop {
         interval.tick().await;
         if let Err(e) = process_one_batch(&pool).await {
@@ -21,17 +25,13 @@ pub async fn start_llm_worker(pool: PgPool) -> Result<(), Box<dyn std::error::Er
 async fn process_one_batch(pool: &PgPool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut tx = pool.begin().await?;
 
-    // 查询需要处理的人类预测（llm_skip=false 且没有对应的 LLM 记录）
+    // 查询需要处理的人类预测（llm_predicted=false 且没有对应的 LLM 记录）
     let rows = sqlx::query!(
         r#"
-        SELECT p.id, p.news_id, n.title, n.description, n.content, n.published_at
-        FROM predictions p
+        SELECT p.id, p.news_id, p.extracted_facts,p.rule_json,p.target_date, p.user_id, n.title,n.description, n.content, n.url, n.published_at
+        FROM prediction_tasks p
         JOIN news n ON p.news_id = n.id
-        WHERE p.prediction_type = 'human'
-          AND p.llm_skip = false
-          AND NOT EXISTS (
-              SELECT 1 FROM predictions l WHERE l.parent_prediction_id = p.id
-          )
+        WHERE  p.llm_predicted = false
         ORDER BY p.id
         LIMIT 10
         FOR UPDATE SKIP LOCKED
@@ -51,7 +51,7 @@ async fn process_one_batch(pool: &PgPool) -> Result<(), Box<dyn std::error::Erro
         // 如果 news_id 为空（异常数据），跳过该条并标记跳过
         if row.news_id.is_none() {
             sqlx::query!(
-                "UPDATE predictions SET llm_skip = true WHERE id = $1",
+                "UPDATE prediction_tasks SET llm_predicted = true WHERE id = $1",
                 row.id
             )
             .execute(&mut *tx)
@@ -64,13 +64,13 @@ async fn process_one_batch(pool: &PgPool) -> Result<(), Box<dyn std::error::Erro
         let should_skip = check_meltdown(
             &mut tx,
             row.news_id.unwrap(),   // 已确保非 None
-            &row.content,
+            &row.extracted_facts,
             row.published_at,      // 假设 published_at 为 NOT NULL，否则需要处理 Option
         )
         .await?;
         if should_skip {
             sqlx::query!(
-                "UPDATE predictions SET llm_skip = true WHERE id = $1",
+                "UPDATE prediction_tasks SET llm_predicted = true WHERE id = $1",
                 row.id
             )
             .execute(&mut *tx)
@@ -80,30 +80,28 @@ async fn process_one_batch(pool: &PgPool) -> Result<(), Box<dyn std::error::Erro
         }
 
         // 调用 LLM 生成预测（模拟/真实）
-        let llm_inference = call_llm(&row.title, row.content.as_deref()).await?;
+        let llm_inference = call_llm(
+            &row.title,
+             row.content.as_deref(),
+            &row.extracted_facts,
+            &row.rule_json,
+            &row.target_date
+            ).await?;
 
         // 插入 LLM 预测记录（继承人类预测的 target_date 和 rule_json）
         let llm_record = sqlx::query!(
             r#"
-            INSERT INTO predictions (
-                news_id, prediction_type, inference, probability,
-                position_size_pct, target_date, rule_json, parent_prediction_id,
-                judge_status, submitted_at
-            )
-            SELECT
-                $1, 'llm', $2, 50.0, 0.0,
-                target_date, rule_json, $3,
-                'pending', NOW()
-            FROM predictions
-            WHERE id = $4
+            INSERT INTO llm_predictions (task_id, inference, inference_rule, probability, position_size_pct)
+            VALUES ($1, $2, $3, $4, $5)
             RETURNING id
             "#,
-            row.news_id,
-            llm_inference,
-            row.id,
-            row.id
+            row.id,              // task_id
+            &llm_inference.inference,       // inference (字符串)
+            &llm_inference.rule_json,     // inference_rule (应该是 JSON 对象，如 serde_json::Value)
+            &llm_inference.probability,         // probability (BigDecimal)
+            &llm_inference.position_size_pct        // position_size_pct (BigDecimal)
         )
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut *tx)      // 使用 execute，而非 fetch_one
         .await?;
 
         info!("为预测 {} 生成了 LLM 对照记录 {}", row.id, llm_record.id);
@@ -117,8 +115,8 @@ async fn process_one_batch(pool: &PgPool) -> Result<(), Box<dyn std::error::Erro
 async fn check_meltdown(
     tx: &mut Transaction<'_, Postgres>,
     news_id: i32,
-    content: &Option<String>,
-    published_at: chrono::DateTime<chrono::Utc>,
+    extracted_facts: &String,
+    published_at: DateTime<chrono::Utc>,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     // 1. 噪声标记检查（noise_flags 表中是否有记录）
     let noise_count = sqlx::query_scalar!(
@@ -135,14 +133,9 @@ async fn check_meltdown(
     }
 
     // 2. 内容过短（< 100 字符）
-    if let Some(c) = content {
-        if c.len() < 100 {
-            warn!("新闻 {} 正文过短 ({} 字符)，触发熔断", news_id, c.len());
-            return Ok(true);
-        }
-    } else {
-        // 没有正文也视为过短（可根据需要调整）
-        warn!("新闻 {} 无正文内容，触发熔断", news_id);
+
+    if extracted_facts.len() < 5 {
+        warn!("新闻 {} 摘取内容过短 -> ({} 字符)，触发熔断", news_id, extracted_facts.len());
         return Ok(true);
     }
 
@@ -157,19 +150,52 @@ async fn check_meltdown(
 }
 
 /// 调用 LLM API（当前使用模拟实现，返回一个占位推演）
-async fn call_llm(title: &str, content: Option<&str>) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+/// 
+#[derive(Deserialize)]
+pub struct LlmResponse {
+    inference: String,
+    probability: BigDecimal,
+    position_size_pct: BigDecimal,   // 修正字段名
+    rule_json: serde_json::Value,
+}
+
+async fn call_llm(
+    title: &str, 
+    content: Option<&str>,
+    extracted_facts: &str,
+    rule_json:&Value,
+    target_date:&NaiveDate
+
+) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
     // 模拟：生成一个简单推演文本
     // 后续可替换为真实的 Gemini/OpenAI 调用
     let _prompt = format!(
-        "根据以下新闻标题和内容，生成一个简要的概率推演（不超过200字）。\n标题：{}\n内容：{}\n推演：",
+        "根据以下新闻标题和内容等信息，生成一个简要的概率推演（按照推演规则格式回复）。\n
+        标题：{}，
+        内容：{}，
+        摘取的事实：{}，
+        推演目标日期：{};
+        推演规则：
+        {}
+        ",
         title,
-        content.unwrap_or("（无正文）")
+        content.unwrap_or("（无正文）"),
+        extracted_facts,
+        target_date.to_string(),
+        rule_json.to_string()
     );
     // 模拟延迟
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // 返回一个固定格式的 LLM 推演（实际应调用 API）
-    Ok(format!("[模拟 LLM] 基于标题「{}」，模型判断该事件有中等概率发生。", title))
+    Ok(
+        LlmResponse{
+            inference:String::from("inference"),
+            probability: BigDecimal::from_f64(0.5).unwrap(),
+            position_size_pct:BigDecimal::from(0),
+            rule_json: json!(rule_json),
+        }
+    )
     
     // 真实 API 调用示例（以 Gemini 为例，需要配置 API key）：
     // let client = Client::new();
